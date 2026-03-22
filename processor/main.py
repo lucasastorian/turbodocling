@@ -321,6 +321,7 @@ class MainService:
             parsed_page=parsed_page,
         )
         page._image_cache = image_cache  # Pre-decoded PIL images
+        page._images_scale = page_dict.get('images_scale', 2.0)  # Actual render scale (may be < 2.0 for large pages)
 
         return page
 

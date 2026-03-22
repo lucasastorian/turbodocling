@@ -15,8 +15,6 @@ class TableStructureModel:
     do_cell_matching: bool = True
 
     def __init__(self):
-        self.scale = 2.0
-
         self.table_preprocessor = TablePreprocessor()
 
     def preprocess(self, pages: List[Page]) -> Dict:
@@ -35,14 +33,15 @@ class TableStructureModel:
             # Always initialize predictions (like original)
             page.predictions.tablestructure = TableStructurePrediction()
 
-            in_tables = self._get_tables_from_page(page)
+            scale = page._images_scale
+            in_tables = self._get_tables_from_page(page, scale)
             if not in_tables:
                 continue
 
             page_input = {
-                "width": page.size.width * self.scale,
-                "height": page.size.height * self.scale,
-                "image": page.get_image_np(scale=self.scale),
+                "width": page.size.width * scale,
+                "height": page.size.height * scale,
+                "image": page.get_image_np(scale=2.0),  # cache key is always 2.0
             }
 
             page_table_bboxes: List[List[float]] = []
@@ -52,7 +51,7 @@ class TableStructureModel:
                 seen_ids = set()
                 aggregated_tokens: List[dict] = []
                 for table_cluster, tbl_box in in_tables:
-                    toks = self._get_table_tokens(page, table_cluster)
+                    toks = self._get_table_tokens(page, table_cluster, scale=scale)
                     for tok in toks:
                         tid = tok.get("id")
                         if tid is None or tid in seen_ids:
@@ -88,9 +87,9 @@ class TableStructureModel:
             'scale_factors': preprocessed_inputs['scale_factors']
         }
 
-    def _get_tables_from_page(self, page: Page):
+    def _get_tables_from_page(self, page: Page, scale: float = 2.0):
         """Return list of (cluster, scaled_bbox) for table-like clusters."""
-        scl = self.scale
+        scl = scale
         return [
             (
                 cluster,
@@ -105,7 +104,7 @@ class TableStructureModel:
             if cluster.label in (DocItemLabel.TABLE, DocItemLabel.DOCUMENT_INDEX)
         ]
 
-    def _get_table_tokens(self, page: Page, table_cluster, ios: float = 0.8):
+    def _get_table_tokens(self, page: Page, table_cluster, ios: float = 0.8, scale: float = 2.0):
         """
         Token aggregation via Page.word_index (TOP-LEFT origin).
         Uses vectorized CellStore query when available, falls back to iteration.
@@ -132,7 +131,7 @@ class TableStructureModel:
             tcells = table_cluster.cells
 
         tokens = []
-        sx = sy = self.scale
+        sx = sy = scale
         for c in tcells:
             text = c.text.strip()
             if not text:
@@ -154,7 +153,7 @@ class TableStructureModel:
         """
         Convert predictor output to Table while preserving original semantics:
         - When not matching, attach text via backend.get_text_in_rect
-        - Always rescale bbox back to page coords (1/self.scale)
+        - Always rescale bbox back to page coords (1/scale)
         """
         table_cells = []
 
@@ -164,7 +163,7 @@ class TableStructureModel:
         tf_responses = table_out.get("tf_responses", ())
         _BoundingBox_validate = BoundingBox.model_validate
         _TableCell_validate = TableCell.model_validate
-        _scale = 1.0 / self.scale
+        _scale = 1.0 / page._images_scale
 
         for element in tf_responses:
             if attach_text:

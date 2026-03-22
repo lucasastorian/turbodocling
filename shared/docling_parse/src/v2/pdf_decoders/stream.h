@@ -51,7 +51,7 @@ namespace pdflib
     void q();
     void Q();
 
-    void execute_operator(qpdf_instruction op, std::vector<qpdf_instruction> parameters);
+    void execute_operator(const qpdf_instruction& op, std::vector<qpdf_instruction>& parameters);
     
   private:
 
@@ -200,43 +200,18 @@ namespace pdflib
         
         if(inst.key=="operator")
           {
-            // pdf_operator::operator_name  name = pdf_operator::to_name(inst.val); 
-            // pdf_operator::operator_class clss = pdf_operator::to_class(name); 
-            
-	    /*
-            if(//clss==pdf_operator::PATH_CONSTRUCTION      or 
-               //clss==pdf_operator::PATH_PAINTING          or
-               clss==pdf_operator::GENERAL_GRAPHICS_STATE or
-               clss==pdf_operator::COLOR_SCHEME            )
+            pdf_operator::operator_name  name = pdf_operator::to_name(inst.val);
+            pdf_operator::operator_class clss = pdf_operator::to_class(name);
+
+            // Skip path drawing operators — they produce lines/rectangles,
+            // not text cells. Safe to skip for text extraction.
+            if(clss==pdf_operator::PATH_CONSTRUCTION or
+               clss==pdf_operator::PATH_PAINTING)
               {
                 parameters.clear();
                 continue;
               }
-	    */
-	    
-	    /*
-            for(auto p:parameters)
-	      {
-		LOG_S(INFO) << "\t" << std::setw(12) << p.key << " | " << p.val;
-	      }
-            LOG_S(INFO) << " --> " << std::setw(12) << inst.key << " | " << inst.val;
-	    */
-	    
-	    for(auto itr=parameters.begin(); itr!=parameters.end(); )
-	      {
-		if(itr->key=="null" and itr->val=="null") // this can happen if you have an empty array/dict
-		  {
-		    LOG_S(ERROR) << "\t" << std::setw(12) << itr->key << " | " << itr->val << " => erasing ...";
-		    itr = parameters.erase(itr);
-		  }
-		else
-		  {
-		    LOG_S(INFO) << "\t" << std::setw(12) << itr->key << " | " << itr->val;
-		    itr++;
-		  }
-	      }
-	    LOG_S(INFO) << " --> " << std::setw(12) << inst.key << " | " << inst.val;
-	    
+
             execute_operator(inst, parameters);
 
             parameters.clear();
@@ -328,8 +303,8 @@ namespace pdflib
       }    
   } 
 
-  void pdf_decoder<STREAM>::execute_operator(qpdf_instruction              op, 
-                                             std::vector<qpdf_instruction> parameters)
+  void pdf_decoder<STREAM>::execute_operator(const qpdf_instruction&              op,
+                                             std::vector<qpdf_instruction>& parameters)
   {
     pdf_operator::operator_name name = pdf_operator::to_name(op.val); 
 

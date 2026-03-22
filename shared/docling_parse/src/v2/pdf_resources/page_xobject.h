@@ -191,8 +191,6 @@ namespace pdflib
       {
         qpdf_stream_decoder decoder(stream);
         decoder.decode(qpdf_xobject);
-        
-        decoder.print();
       }
     catch(const std::exception& exc)
       {

@@ -47,7 +47,6 @@ class TablePostprocessingModel:
         self._cell_matcher = CellMatcher()
         self._post_processor = MatchingPostProcessor()
 
-        self.scale = 2.0
 
     def postprocess(self,
                     all_predictions,
@@ -176,7 +175,7 @@ class TablePostprocessingModel:
         """
         Convert predictor output to Table while preserving original semantics:
         - When not matching, attach text via backend.get_text_in_rect
-        - Always rescale bbox back to page coords (1/self.scale)
+        - Always rescale bbox back to page coords (1/scale)
         """
         table_cells = []
 
@@ -186,7 +185,7 @@ class TablePostprocessingModel:
         tf_responses = table_out.get("tf_responses", ())
         _BoundingBox_validate = BoundingBox.model_validate
         _TableCell_validate = TableCell.model_validate
-        _scale = 1.0 / self.scale
+        _scale = 1.0 / page._images_scale
 
         for element in tf_responses:
             if attach_text:

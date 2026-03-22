@@ -71,7 +71,8 @@ while time.time() < deadline:
 
     if state == "SUCCEEDED":
         output = json.loads(status["output"])
-        print(f"\n=== SUCCESS in {elapsed:.1f}s ===")
+        sfn_elapsed = (status["stopDate"] - status["startDate"]).total_seconds()
+        print(f"\n=== SUCCESS in {sfn_elapsed:.1f}s (poll: {elapsed:.1f}s) ===")
         print(f"Output: {json.dumps(output, indent=2)}")
 
         # Download and inspect results

@@ -347,8 +347,12 @@ class PdfDocument:
         create_textlines: bool,
         enforce_same_font: bool = True,
     ) -> SegmentedPdfPage:
+        import time as _t
 
+        t0 = _t.time()
         char_cells = self._to_cells(page["cells"])
+        t1 = _t.time()
+
         segmented_page = SegmentedPdfPage(
             dimension=self._to_page_geometry(page["dimension"]),
             char_cells=char_cells,
@@ -358,16 +362,26 @@ class PdfDocument:
             bitmap_resources=self._to_bitmap_resources(page["images"]),
             lines=self._to_lines(page["lines"]),
         )
+        t2 = _t.time()
 
         char_data = self._build_char_data(char_cells) if (create_words or create_textlines) else None
+        t3 = _t.time()
 
         if create_words:
             self._create_word_cells(segmented_page, char_data=char_data, enforce_same_font=enforce_same_font)
+        t4 = _t.time()
 
         if create_textlines:
             self._create_textline_cells(
                 segmented_page, char_data=char_data, enforce_same_font=enforce_same_font
             )
+        t5 = _t.time()
+
+        n_chars = len(char_cells)
+        if n_chars > 500 or (t5 - t0) > 0.5:
+            print(f"[docling_parse] _to_segmented_page: chars={n_chars} words={len(segmented_page.word_cells)} lines={len(segmented_page.textline_cells)} | "
+                  f"to_cells={1000*(t1-t0):.0f}ms seg_init={1000*(t2-t1):.0f}ms char_data={1000*(t3-t2):.0f}ms "
+                  f"words={1000*(t4-t3):.0f}ms textlines={1000*(t5-t4):.0f}ms total={1000*(t5-t0):.0f}ms")
 
         return segmented_page
 

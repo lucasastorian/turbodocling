@@ -75,6 +75,15 @@ class TurboStack(Stack):
         lambda_version = pdf_processor.current_version
 
         # Step Function definition
+        # Compute optimal batch_size: ceil(total_pages / 40)
+        # Step Functions lacks division, so we use Choice thresholds.
+        # <=40 pages → bs=1, <=80 → bs=2, <=120 → bs=3, etc.
+        set_bs = lambda n: sfn.Pass(
+            self, f"SetBatchSize{n}",
+            result=sfn.Result.from_number(n),
+            result_path="$.batch_size",
+        )
+
         prepare_pages = sfn.Pass(
             self, "PreparePages",
             parameters={
@@ -84,6 +93,26 @@ class TurboStack(Stack):
                 "batch_size.$": "$.batch_size",
                 "page_indices.$": "States.ArrayRange(0, States.MathAdd($.total_pages, -1), $.batch_size)",
             },
+        )
+
+        choose_batch_size = sfn.Choice(self, "ChooseBatchSize")
+        choose_batch_size.when(
+            sfn.Condition.number_less_than_equals("$.total_pages", 40),
+            set_bs(1).next(prepare_pages),
+        ).when(
+            sfn.Condition.number_less_than_equals("$.total_pages", 80),
+            set_bs(2).next(prepare_pages),
+        ).when(
+            sfn.Condition.number_less_than_equals("$.total_pages", 120),
+            set_bs(3).next(prepare_pages),
+        ).when(
+            sfn.Condition.number_less_than_equals("$.total_pages", 160),
+            set_bs(4).next(prepare_pages),
+        ).when(
+            sfn.Condition.number_less_than_equals("$.total_pages", 200),
+            set_bs(5).next(prepare_pages),
+        ).otherwise(
+            set_bs(6).next(prepare_pages),
         )
 
         process_batch_task = tasks.LambdaInvoke(
@@ -130,7 +159,8 @@ class TurboStack(Stack):
 
         success = sfn.Succeed(self, "ProcessingComplete")
 
-        definition = prepare_pages.next(process_batches).next(send_to_gpu).next(success)
+        prepare_pages.next(process_batches).next(send_to_gpu).next(success)
+        definition = choose_batch_size
 
         state_machine = sfn.StateMachine(
             self, "PdfProcessingStateMachine",

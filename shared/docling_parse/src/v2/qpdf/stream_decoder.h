@@ -92,49 +92,47 @@ namespace pdflib
 
   void qpdf_stream_decoder::handleObject(QPDFObjectHandle obj, size_t offset, size_t len)
   {
-    //LOG_S(INFO) << __FUNCTION__ << "\t offset: " << offset << ", len: " << len;
-
     qpdf_instruction row;
-    {
-      row.key = obj.getTypeName();
-      row.val = obj.unparse();
-      row.obj = obj;
+    row.obj = obj;
 
-      //LOG_S(INFO) << std::setw(12) << row.key << " | " << row.val;
-    }
-
-    /*
-    if(row.is_null() or row.is_array() or row.is_dict())
+    if(obj.isNull())
       {
-	LOG_S(WARNING) << "null: " << row.is_null() << ", array: " << row.is_array() << ", dict: " << row.is_dict();
+        // Reinterpret null as empty array (workaround for 'd' operator, Table 56)
+        row.key = "parameter";
+        row.val = "[]";
       }
-    */
-
-    std::smatch match;
-    
-    // if the row is null, reinterprete it as an empty array. We encountered
-    // this usecase for a parameter of the d operator (see Table 56) that is
-    // null but in reality should be an empty array.
-    if(row.is_null()) 
+    else if(obj.isOperator())
       {
-	row.key = "parameter";
-	row.val = "[]";
+        // Operators: need key + val for dispatch, but skip regex
+        row.key = obj.getTypeName();
+        row.val = obj.unparse();
       }
-    else if (std::regex_match(row.val, match, value_pattern_0))
+    else
       {
-	LOG_S(WARNING) << std::setw(12) << row.key << " | " << row.val << " => new matched value: " << match[1];
+        row.key = obj.getTypeName();
+        row.val = obj.unparse();
 
-	double value = std::stod(match[1].str());
-	
-	// Creating a real (floating-point) QPDFObjectHandle
-	QPDFObjectHandle new_obj = QPDFObjectHandle::newReal(value);
+        // Only run the malformed-float regex on real/integer tokens that
+        // contain a dash (extremely rare edge case: "1.234-5")
+        if(obj.isNumber() && row.val.find('-') != std::string::npos)
+          {
+            std::smatch match;
+            if(std::regex_match(row.val, match, value_pattern_0))
+              {
+                LOG_S(WARNING) << std::setw(12) << row.key << " | " << row.val
+                               << " => new matched value: " << match[1];
 
-	row.key = new_obj.getTypeName();
-	row.val = new_obj.unparse();
-	row.obj = new_obj;
+                double value = std::stod(match[1].str());
+                QPDFObjectHandle new_obj = QPDFObjectHandle::newReal(value);
+
+                row.key = new_obj.getTypeName();
+                row.val = new_obj.unparse();
+                row.obj = new_obj;
+              }
+          }
       }
-    
-    stream.push_back(row);
+
+    stream.push_back(std::move(row));
   }
 
   void qpdf_stream_decoder::contentSize(size_t len)

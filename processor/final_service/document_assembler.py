@@ -1,4 +1,4 @@
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import base64
 from io import BytesIO
 
@@ -18,7 +18,6 @@ logger = get_logger(__name__)
 class DocumentAssembler:
     """Final assembly - can run on Lambda or GPU."""
 
-    images_scale: int = 2
 
     def __init__(self, pipeline_options=None):
         self.pipeline_options = pipeline_options or PdfPipelineOptions()
@@ -73,23 +72,25 @@ class DocumentAssembler:
         # Build page lookup to avoid O(n) scan per picture
         page_by_ix = {p.page_no: p for p in conv_res.pages}
 
-        for element, _level in conv_res.document.iterate_items():
-            if isinstance(element, PictureItem) and len(element.prov) > 0:
+        # Iterate directly over picture items to avoid traversing all document nodes.
+        for element in conv_res.document.pictures:
+            if len(element.prov) > 0:
                 page = page_by_ix.get(element.prov[0].page_no - 1)
 
                 if page and page.image:
+                    scale = page._images_scale
                     crop_bbox = (
                         element.prov[0]
-                        .bbox.scaled(scale=self.images_scale)
+                        .bbox.scaled(scale=scale)
                         .to_top_left_origin(
-                            page_height=page.size.height * self.images_scale
+                            page_height=page.size.height * scale
                         )
                     )
 
                     cropped_im = page.image.crop(crop_bbox.as_tuple())
                     element.image = ImageRef.from_pil(
                         cropped_im,
-                        dpi=int(72 * self.images_scale)
+                        dpi=int(72 * scale)
                     )
                     count += 1
 
@@ -100,6 +101,15 @@ class DocumentAssembler:
         doc = conv_res.document
         pages_map: Dict[int, List[Dict[str, Any]]] = {}
         page_sizes: Dict[int, Dict[str, float]] = {}
+        table_md_serializer: Optional[Any] = None
+
+        # Per-type timers/counters for bottleneck attribution.
+        n_text = n_table = n_picture = n_other = 0
+        pic_reused_data_uri = 0
+        t_table_md = 0.0
+        t_picture_total = 0.0
+        t_picture_png = 0.0
+        t_iter_start = now()
 
         # Get page sizes
         for page in conv_res.pages:
@@ -130,6 +140,7 @@ class DocumentAssembler:
             }
 
             if isinstance(element, TextItem):
+                n_text += 1
                 # Map label to cleaner type names
                 label_str = str(element.label).lower().replace("docitemlabel.", "")
                 elem_data["type"] = label_str
@@ -138,24 +149,47 @@ class DocumentAssembler:
                     elem_data["level"] = element.level
 
             elif isinstance(element, TableItem):
+                n_table += 1
+                t_tbl0 = now()
                 elem_data["type"] = "table"
                 # Export table to markdown
                 if element.data:
-                    elem_data["content"] = element.export_to_markdown(doc=doc)
+                    # Reuse one serializer for all tables in this document to avoid
+                    # repeated serializer construction and document scans.
+                    if table_md_serializer is None:
+                        from docling_core.transforms.serializer.markdown import MarkdownDocSerializer
+
+                        table_md_serializer = MarkdownDocSerializer(doc=doc)
+                    elem_data["content"] = table_md_serializer.serialize(item=element).text
                 else:
                     elem_data["content"] = ""
+                t_table_md += now() - t_tbl0
 
             elif isinstance(element, PictureItem):
+                n_picture += 1
                 elem_data["type"] = "picture"
                 elem_data["content"] = ""
 
                 # Include base64 image if available
-                if element.image and element.image.pil_image:
-                    buf = BytesIO()
-                    element.image.pil_image.save(buf, format="PNG")
-                    elem_data["image_base64"] = base64.b64encode(buf.getvalue()).decode("utf-8")
+                if element.image:
+                    t_pic0 = now()
+                    image_uri = str(getattr(element.image, "uri", ""))
+
+                    # Fast path: ImageRef.from_pil already stores a data URI.
+                    if image_uri.startswith("data:") and ";base64," in image_uri:
+                        elem_data["image_base64"] = image_uri.split(",", 1)[1]
+                        pic_reused_data_uri += 1
+                    elif element.image.pil_image:
+                        t_png0 = now()
+                        buf = BytesIO()
+                        element.image.pil_image.save(buf, format="PNG")
+                        elem_data["image_base64"] = base64.b64encode(buf.getvalue()).decode("utf-8")
+                        t_picture_png += now() - t_png0
+
+                    t_picture_total += now() - t_pic0
 
             else:
+                n_other += 1
                 # Other element types
                 elem_data["type"] = type(element).__name__.lower().replace("item", "")
                 elem_data["content"] = getattr(element, 'text', '') or ""
@@ -163,7 +197,10 @@ class DocumentAssembler:
             if page_no in pages_map:
                 pages_map[page_no].append(elem_data)
 
+        t_iter_end = now()
+
         # Build final structure
+        t_build0 = now()
         result = {
             "pages": []
         }
@@ -176,7 +213,15 @@ class DocumentAssembler:
                 "elements": pages_map[page_no]
             }
             result["pages"].append(page_data)
+        t_build1 = now()
 
         n_elems = sum(len(p) for p in pages_map.values())
-        logger.info(f"extract_structured: {len(pages_map)} pages {n_elems} elements {ms(now()-t0):.0f}ms")
+        logger.info(
+            f"extract_structured: {len(pages_map)} pages {n_elems} elements "
+            f"total={ms(now() - t0):.0f}ms loop={ms(t_iter_end - t_iter_start):.0f}ms "
+            f"build={ms(t_build1 - t_build0):.0f}ms | "
+            f"text={n_text} table={n_table} picture={n_picture} other={n_other} | "
+            f"table_md={ms(t_table_md):.0f}ms pic_total={ms(t_picture_total):.0f}ms "
+            f"pic_png={ms(t_picture_png):.0f}ms pic_reuse={pic_reused_data_uri}"
+        )
         return result

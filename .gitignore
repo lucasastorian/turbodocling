@@ -23,3 +23,18 @@ cdk.out
 
 # Local notes
 QUESTIONS.md
+CLAUDE.md
+
+cdk.context.json
+
+# Test scripts with account-specific ARNs/bucket names
+tests/smoke_test.py
+tests/trace_job.py
+tests/test_golden.py
+tests/bench_parse.py
+tests/integration/
+
+# Golden test data (copyrighted PDFs + account-specific expected output)
+tests/golden/pdfs/
+tests/golden/expected/
+tests/golden/parse_baselines/

@@ -334,15 +334,19 @@ class LayoutPostprocessor:
         
         # Initialize CPU timer
         self.timer = _CPUTimer()
-        
+
+        # Kernel-level counters for profiling (populated by hot loops)
+        self._counters: Dict[str, Any] = {}
+
         # Track assigned cells to avoid full scan later
         self._assigned_cell_indices = None
-        self._valid_cells = None
-        
+
         # Cache cell geometry once per page: BoundingBox, as_tuple, and area
+        # Also precompute valid_cells list (cells with non-empty text and positive area)
         self._cell_bbox = {}       # index -> BoundingBox (for methods like intersection_over_self)
         self._cell_box = {}        # index -> as_tuple() result (l,t,r,b normalized)
         self._cell_area = {}       # index -> float area
+        self._valid_cells = []     # precomputed: cells with valid bbox
         for cell in self.cells:
             txt = getattr(cell, "text", None)
             if not txt or not txt.strip():
@@ -353,6 +357,7 @@ class LayoutPostprocessor:
                 self._cell_bbox[cell.index] = bb
                 self._cell_box[cell.index] = bb.as_tuple()
                 self._cell_area[cell.index] = a
+                self._valid_cells.append(cell)
 
         # Build spatial indices once (regular clusters use GridIndex, not R-tree)
         self.picture_index = SpatialClusterIndex(
@@ -392,6 +397,9 @@ class LayoutPostprocessor:
         assert self.page.parsed_page is not None
         self.page.parsed_page.textline_cells = self.cells
         self.page.parsed_page.has_lines = len(self.cells) > 0
+
+        # Emit section-level timings for slow pages (or always when enabled).
+        self._log_timing_breakdown()
 
         return final_clusters, self.cells
 
@@ -445,22 +453,26 @@ class LayoutPostprocessor:
                     clusters.extend(orphan_clusters)
 
         # Iterative refinement
+        iter_stats = []
         with self.timer.time_section("iterative_refinement"):
             prev_count = len(clusters) + 1
             for iteration in range(3):  # Maximum 3 iterations
                 if prev_count == len(clusters):
                     break
                 prev_count = len(clusters)
-                
+
                 with self.timer.time_section(f"adjust_bboxes_iter{iteration}"):
                     clusters, moved = self._adjust_cluster_bboxes(clusters)
-                
+
                 with self.timer.time_section(f"overlaps_regular_iter{iteration}"):
                     clusters, merged = self._remove_overlapping_clusters(clusters, "regular")
-                
+
+                iter_stats.append({"iter": iteration, "moved": moved, "merged": merged, "n_clusters": len(clusters)})
+
                 # Early break if nothing changed
                 if not moved and not merged:
                     break
+        self._counters["iterative"] = iter_stats
 
         return clusters
 
@@ -491,33 +503,7 @@ class LayoutPostprocessor:
                 ]
 
         with self.timer.time_section("assign_children"):
-            for special in special_clusters:
-                contained = []
-                for cluster in self.regular_clusters:
-                    containment = cluster.bbox.intersection_over_self(special.bbox)
-                    if containment > 0.8:
-                        contained.append(cluster)
-
-                if contained:
-                    # Sort contained clusters by minimum cell ID:
-                    contained = self._sort_clusters(contained, mode="id")
-                    special.children = contained
-
-                    # Adjust bbox only for Form and Key-Value-Region, not Table or Picture
-                    if special.label in [DocItemLabel.FORM, DocItemLabel.KEY_VALUE_REGION]:
-                        special.bbox = BoundingBox.model_construct(
-                            l=min(c.bbox.l for c in contained),
-                            t=min(c.bbox.t for c in contained),
-                            r=max(c.bbox.r for c in contained),
-                            b=max(c.bbox.b for c in contained),
-                        )
-
-                    # Collect all cells from children
-                    all_cells = []
-                    for child in contained:
-                        all_cells.extend(child.cells)
-                    special.cells = self._deduplicate_cells(all_cells)
-                    special.cells = self._sort_cells(special.cells)
+            self._assign_children_to_special_clusters(special_clusters)
 
         with self.timer.time_section("overlaps_picture"):
             picture_clusters = [
@@ -537,6 +523,93 @@ class LayoutPostprocessor:
 
         return picture_clusters + wrapper_clusters
 
+    def _assign_children_to_special_clusters(self, special_clusters: List[Cluster]) -> None:
+        """Assign regular clusters as children of special clusters."""
+        if not special_clusters or not self.regular_clusters:
+            return
+
+        for special in special_clusters:
+            contained = []
+            for cluster in self.regular_clusters:
+                containment = cluster.bbox.intersection_over_self(special.bbox)
+                if containment > 0.8:
+                    contained.append(cluster)
+            self._attach_children(special, contained)
+
+    def _attach_children(self, special: Cluster, contained: List[Cluster]) -> None:
+        """Attach contained clusters/cells to a special cluster."""
+        if not contained:
+            return
+
+        # Sort contained clusters by minimum cell index.
+        contained = self._sort_clusters(contained, mode="id")
+        special.children = contained
+
+        # Adjust bbox only for Form and Key-Value-Region, not Table or Picture
+        if special.label in [DocItemLabel.FORM, DocItemLabel.KEY_VALUE_REGION]:
+            special.bbox = BoundingBox.model_construct(
+                l=min(c.bbox.l for c in contained),
+                t=min(c.bbox.t for c in contained),
+                r=max(c.bbox.r for c in contained),
+                b=max(c.bbox.b for c in contained),
+            )
+
+        # Collect all cells from children
+        all_cells = []
+        for child in contained:
+            all_cells.extend(child.cells)
+        special.cells = self._deduplicate_cells(all_cells)
+        special.cells = self._sort_cells(special.cells)
+
+    def _log_timing_breakdown(self) -> None:
+        """Log per-section timing breakdown for layout postprocessing."""
+        import json as _json
+
+        times = self.timer.times
+        if not times:
+            return
+
+        total_ms = sum(times.values())
+        always_log = os.getenv("LAYOUT_PP_PROFILE", "").lower() in ("1", "true", "yes")
+        slow_ms = float(os.getenv("LAYOUT_PP_SLOW_MS", "40"))
+        if not always_log and total_ms < slow_ms:
+            return
+
+        # Page-shape features
+        n_tables = sum(1 for c in self.all_clusters if c.label == DocItemLabel.TABLE)
+        n_pictures = sum(1 for c in self.all_clusters if c.label == DocItemLabel.PICTURE)
+        n_valid_cells = len(self._cell_bbox)
+
+        # Human-readable line
+        parts = sorted(times.items(), key=lambda kv: kv[1], reverse=True)
+        top_parts = " ".join(f"{name}={val:.1f}ms" for name, val in parts[:8])
+        _log.info(
+            f"layout_pp: page={self.page.page_no} "
+            f"clusters={len(self.all_clusters)} regular={len(self.regular_clusters)} "
+            f"special={len(self.special_clusters)} cells={n_valid_cells}/{len(self.cells)} "
+            f"tables={n_tables} pics={n_pictures} "
+            f"total={total_ms:.1f}ms | {top_parts}"
+        )
+
+        # Structured JSON event (machine-parseable)
+        event = {
+            "event": "layout_pp_profile",
+            "page": self.page.page_no,
+            "shape": {
+                "clusters_in": len(self.all_clusters),
+                "regular": len(self.regular_clusters),
+                "special": len(self.special_clusters),
+                "cells_total": len(self.cells),
+                "cells_valid": n_valid_cells,
+                "tables": n_tables,
+                "pictures": n_pictures,
+            },
+            "timing_ms": {k: round(v, 1) for k, v in times.items()},
+            "total_ms": round(total_ms, 1),
+            "counters": self._counters,
+        }
+        _log.info(f"layout_pp_json: {_json.dumps(event, separators=(',', ':'))}")
+
     def _handle_cross_type_overlaps(self, special_clusters) -> List[Cluster]:
         """Handle overlaps between regular and wrapper clusters before child assignment.
 
@@ -544,24 +617,24 @@ class LayoutPostprocessor:
         should be removed.
         """
         wrappers_to_remove = set()
+        table_clusters = [r for r in self.regular_clusters if r.label == DocItemLabel.TABLE]
 
         for wrapper in special_clusters:
             if wrapper.label not in self.WRAPPER_TYPES:
                 continue  # only treat KEY_VALUE_REGION for now.
 
-            for regular in self.regular_clusters:
-                if regular.label == DocItemLabel.TABLE:
-                    # Calculate overlap
-                    overlap_ratio = wrapper.bbox.intersection_over_self(regular.bbox)
+            for regular in table_clusters:
+                # Calculate overlap
+                overlap_ratio = wrapper.bbox.intersection_over_self(regular.bbox)
 
-                    conf_diff = wrapper.confidence - regular.confidence
+                conf_diff = wrapper.confidence - regular.confidence
 
-                    # If wrapper is mostly overlapping with a TABLE, remove the wrapper
-                    if (
-                            overlap_ratio > 0.9 and conf_diff < 0.1
-                    ):  # self.OVERLAP_PARAMS["wrapper"]["conf_threshold"]):  # 80% overlap threshold
-                        wrappers_to_remove.add(wrapper.id)
-                        break
+                # If wrapper is mostly overlapping with a TABLE, remove the wrapper
+                if (
+                        overlap_ratio > 0.9 and conf_diff < 0.1
+                ):  # self.OVERLAP_PARAMS["wrapper"]["conf_threshold"]):  # 80% overlap threshold
+                    wrappers_to_remove.add(wrapper.id)
+                    break
 
         # Filter out the identified wrappers
         special_clusters = [
@@ -651,6 +724,10 @@ class LayoutPostprocessor:
         if not clusters:
             return [], False
 
+        _ovlp_path = "none"
+        _ovlp_pairs_checked = 0
+        _ovlp_unions = 0
+
         # Regular clusters use GridIndex (below), picture/wrapper use R-tree
         spatial_index = (
             self.picture_index
@@ -666,11 +743,12 @@ class LayoutPostprocessor:
         if cluster_type == "regular":
             # Small cluster count: use simple O(N²) pairwise
             if len(clusters) < 20:
+                _ovlp_path = "small_pairwise"
                 boxes = {c.id: c.bbox.as_tuple() for c in clusters}
                 areas = {c.id: c.bbox.area() for c in clusters}
                 ovlp_thr = overlap_threshold - self.epsilon
                 cont_thr = containment_threshold - self.epsilon
-                
+
                 def overlaps(a: int, b: int) -> bool:
                     l1, t1, r1, b1 = boxes[a]
                     l2, t2, r2, b2 = boxes[b]
@@ -688,17 +766,20 @@ class LayoutPostprocessor:
                     if bb > 0.0 and interA / bb >= cont_thr: return True
                     denom = aa + bb - interA
                     return denom > 0.0 and (interA / denom) >= ovlp_thr
-                
+
                 # Simple pairwise check
                 cluster_ids = [c.id for c in clusters]
                 for i, cid in enumerate(cluster_ids):
                     for oid in cluster_ids[i+1:]:
                         if cid not in valid_clusters or oid not in valid_clusters:
                             continue
+                        _ovlp_pairs_checked += 1
                         if overlaps(cid, oid):
+                            _ovlp_unions += 1
                             uf.union(cid, oid)
             else:
                 # Grid bucketing for dense pages with packed arrays
+                _ovlp_path = "grid"
                 # Pack geometry into contiguous arrays once
                 cluster_list = list(clusters)
                 N = len(cluster_list)
@@ -745,41 +826,47 @@ class LayoutPostprocessor:
                 temp_arrays = tuple(np.empty(MAX_TILE, dtype=np.float32) for _ in range(9))
                 
                 # Union only within shared grid cells (optimized)
+                _n_vectorized = 0
+                _n_scalar = 0
                 for i, c in enumerate(cluster_list):
                     cid = c.id
                     query_box = boxes[i]
-                    
+
                     # Get candidate indices (no sorting for speed)
-                    candidate_indices = [j for j in grid.candidates(*query_box) 
+                    candidate_indices = [j for j in grid.candidates(*query_box)
                                        if j > i and ix2id[j] in valid_clusters]
-                    
+
                     if not candidate_indices:
                         continue
-                    
+
                     K = len(candidate_indices)
-                    
+                    _ovlp_pairs_checked += K
+
                     # Use vectorization only for large candidate sets
                     if K >= 64:
+                        _n_vectorized += 1
                         # Vectorized path
                         overlap_mask = vectorized_overlap_check_with_arrays(
                             i, candidate_indices, boxes, areas, ovlp_thr, cont_thr, temp_arrays
                         )
-                        
+
                         # Union overlapping pairs
                         for j in np.nonzero(overlap_mask)[0]:
+                            _ovlp_unions += 1
                             uf.union(cid, ix2id[candidate_indices[j]])
                     else:
+                        _n_scalar += 1
                         # Scalar fast path for small candidate sets
                         for j in candidate_indices:
                             other_id = ix2id[j]
-                            
+
                             # Quick AABB reject using packed arrays
                             l1, t1, r1, b1 = boxes[i]
                             l2, t2, r2, b2 = boxes[j]
                             if l2 >= r1 or r2 <= l1 or t2 >= b1 or b2 <= t1:
                                 continue
-                            
-                            # Scalar overlap check 
+
+                            # Scalar overlap check
                             l = max(l1, l2); t = max(t1, t2); r = min(r1, r2); b = min(b1, b2)
                             iw = r - l; ih = b - t
                             if iw <= 0.0 or ih <= 0.0:
@@ -787,13 +874,16 @@ class LayoutPostprocessor:
                             interA = iw * ih
                             aa, bb = areas[i], areas[j]
                             if aa > 0.0 and interA / aa >= cont_thr:
+                                _ovlp_unions += 1
                                 uf.union(cid, other_id)
                                 continue
                             if bb > 0.0 and interA / bb >= cont_thr:
+                                _ovlp_unions += 1
                                 uf.union(cid, other_id)
                                 continue
                             denom = aa + bb - interA
                             if denom > 0.0 and (interA / denom) >= ovlp_thr:
+                                _ovlp_unions += 1
                                 uf.union(cid, other_id)
         else:
             # Keep existing logic for picture/wrapper clusters
@@ -814,12 +904,14 @@ class LayoutPostprocessor:
 
         result = []
         merged = False
+        n_merges = 0
         for group in uf.get_groups().values():
             if len(group) == 1:
                 result.append(valid_clusters[group[0]])
                 continue
 
             merged = True  # Something was merged
+            n_merges += 1
             group_clusters = [valid_clusters[cid] for cid in group]
             best = self._select_best_cluster_from_group(group_clusters, params)
 
@@ -830,6 +922,15 @@ class LayoutPostprocessor:
 
             best.cells = self._deduplicate_cells(best.cells)
             result.append(best)
+
+        # Store overlap counters (keyed by cluster_type to allow multiple calls)
+        self._counters[f"overlap_{cluster_type}"] = {
+            "path": _ovlp_path,
+            "n_clusters": len(clusters),
+            "pairs_checked": _ovlp_pairs_checked,
+            "unions": _ovlp_unions,
+            "merges": n_merges,
+        }
 
         return result, merged
 
@@ -890,6 +991,11 @@ class LayoutPostprocessor:
             self, clusters: List[Cluster], min_overlap: float = 0.2
     ) -> List[Cluster]:
         """Assign cells to best overlapping cluster using GridIndex optimization."""
+        import time as _time
+
+        t_cpu0 = _time.thread_time()
+        t_wall0 = _time.perf_counter()
+
         # Initialize clusters and track first cell index for fast sorting
         for cluster in clusters:
             cluster.cells = []
@@ -898,21 +1004,21 @@ class LayoutPostprocessor:
         # Early exit for empty inputs
         if not clusters or not self.cells:
             return clusters
-            
-        # Use cached cell bboxes and track assigned cells
-        valid_cells = [c for c in self.cells if c.index in self._cell_bbox]
-        self._valid_cells = valid_cells  # save for later unassigned check
-        self._assigned_cell_indices = set()
 
-        # Build geometry arrays for fast access
+        # --- Phase: build_valid (precomputed in __init__) ---
+        t0 = _time.perf_counter()
+        valid_cells = self._valid_cells
+        self._assigned_cell_indices = set()
+        t_build_valid = _time.perf_counter() - t0
+
+        # --- Phase: build_grid ---
+        t0 = _time.perf_counter()
         id_to_cluster = {c.id: c for c in clusters}
         cluster_boxes = {c.id: c.bbox.as_tuple() for c in clusters}
 
-        # Build grid for assignment (reuse page size logic from overlap)
         if self.page_size is not None:
             page_w, page_h = self.page_size.width, self.page_size.height
         else:
-            # Fallback to cluster extents
             min_l = min(l for (l, _, _, _) in cluster_boxes.values())
             min_t = min(t for (_, t, _, _) in cluster_boxes.values())
             max_r = max(r for (_, _, r, _) in cluster_boxes.values())
@@ -920,7 +1026,6 @@ class LayoutPostprocessor:
             page_w = max_r - min_l
             page_h = max_b - min_t
 
-        # Use median-based bin sizing
         ws = sorted((r - l) for (l, t, r, b) in cluster_boxes.values() if r > l)
         hs = sorted((b - t) for (l, t, r, b) in cluster_boxes.values() if b > t)
         med_w = ws[len(ws) // 2] if ws else max(1.0, page_w / 12.0)
@@ -929,10 +1034,19 @@ class LayoutPostprocessor:
         bin_w = max(page_w / 60.0, 1.5 * med_w)
         bin_h = max(page_h / 60.0, 1.5 * med_h)
 
-        # Build assignment grid
         assign_grid = GridIndex(page_w, page_h, bin_w, bin_h)
         for cid, (l, t, r, b) in cluster_boxes.items():
             assign_grid.insert(cid, l, t, r, b)
+        t_build_grid = _time.perf_counter() - t0
+
+        # Compute cluster hull for miss-rate stats
+        if cluster_boxes:
+            hull_l = min(l for (l, _, _, _) in cluster_boxes.values())
+            hull_t = min(t for (_, t, _, _) in cluster_boxes.values())
+            hull_r = max(r for (_, _, r, _) in cluster_boxes.values())
+            hull_b = max(b for (_, _, _, b) in cluster_boxes.values())
+        else:
+            hull_l = hull_t = hull_r = hull_b = 0.0
 
         # Local refs for inner-loop speed
         cell_box_cache = self._cell_box
@@ -940,18 +1054,45 @@ class LayoutPostprocessor:
         assigned = self._assigned_cell_indices
         grid_candidates = assign_grid.candidates
 
-        # Assign each cell to best overlapping cluster
-        # Intersection-over-self is inlined to avoid pydantic method call overhead
+        # --- Phase: candidate_lookup + overlap_eval ---
+        t0 = _time.perf_counter()
+        n_assigned = 0
+        n_no_cands = 0
+        n_early_breaks = 0
+        n_outside_hull = 0
+        cands_per_cell = []
+        bins_per_cell = []
+
+        grid_bin_w = assign_grid.bin_w
+        grid_bin_h = assign_grid.bin_h
+        grid_nx = assign_grid.nx
+        grid_ny = assign_grid.ny
+
         for cell in valid_cells:
             cidx = cell.index
             cl, ct, cr, cb = cell_box_cache[cidx]
             cell_area = cell_area_cache[cidx]
 
+            # Track cells outside cluster hull
+            if cr < hull_l or cl > hull_r or cb < hull_t or ct > hull_b:
+                n_outside_hull += 1
+
+            # Track bins touched
+            ix0 = max(0, min(int(cl / grid_bin_w), grid_nx - 1))
+            ix1 = max(0, min(int(max(cr - 1e-9, cl) / grid_bin_w), grid_nx - 1))
+            iy0 = max(0, min(int(ct / grid_bin_h), grid_ny - 1))
+            iy1 = max(0, min(int(max(cb - 1e-9, ct) / grid_bin_h), grid_ny - 1))
+            bins_touched = (ix1 - ix0 + 1) * (iy1 - iy0 + 1)
+            bins_per_cell.append(bins_touched)
+
             # Get candidates from grid
             cands = grid_candidates(cl, ct, cr, cb)
             if not cands:
+                n_no_cands += 1
                 continue
 
+            n_cands = len(cands)
+            cands_per_cell.append(n_cands)
             best_overlap = min_overlap
             best_cid = None
 
@@ -959,7 +1100,6 @@ class LayoutPostprocessor:
                 if cluster_id not in id_to_cluster:
                     continue
                 bl, bt, br, bb_val = cluster_boxes[cluster_id]
-                # Inline intersection-over-self: intersect then divide by cell area
                 ix_l = cl if cl > bl else bl
                 ix_t = ct if ct > bt else bt
                 ix_r = cr if cr < br else br
@@ -975,14 +1115,49 @@ class LayoutPostprocessor:
                     best_overlap = overlap_ratio
                     best_cid = cluster_id
                     if best_overlap >= 0.95:
+                        n_early_breaks += 1
                         break
 
             if best_cid is not None:
+                n_assigned += 1
                 cluster = id_to_cluster[best_cid]
                 cluster.cells.append(cell)
                 if cidx < cluster._first_cell_index:
                     cluster._first_cell_index = cidx
                 assigned.add(cidx)
+
+        t_loop = _time.perf_counter() - t0
+        t_cpu1 = _time.thread_time()
+        t_wall1 = _time.perf_counter()
+
+        # Store kernel counters
+        ac = {
+            "valid_cells": len(valid_cells),
+            "assigned": n_assigned,
+            "no_cands": n_no_cands,
+            "outside_hull": n_outside_hull,
+            "early_breaks": n_early_breaks,
+            "wall_ms": round(1000 * (t_wall1 - t_wall0), 1),
+            "cpu_ms": round(1000 * (t_cpu1 - t_cpu0), 1),
+            "build_valid_ms": round(1000 * t_build_valid, 1),
+            "build_grid_ms": round(1000 * t_build_grid, 1),
+            "loop_ms": round(1000 * t_loop, 1),
+            "grid": {"nx": grid_nx, "ny": grid_ny,
+                     "bin_w": round(grid_bin_w, 1), "bin_h": round(grid_bin_h, 1)},
+        }
+        if cands_per_cell:
+            cands_per_cell.sort()
+            n = len(cands_per_cell)
+            ac["cands_p50"] = cands_per_cell[n // 2]
+            ac["cands_p95"] = cands_per_cell[int(n * 0.95)]
+            ac["cands_max"] = cands_per_cell[-1]
+        if bins_per_cell:
+            bins_per_cell.sort()
+            n = len(bins_per_cell)
+            ac["bins_p50"] = bins_per_cell[n // 2]
+            ac["bins_p95"] = bins_per_cell[int(n * 0.95)]
+            ac["bins_max"] = bins_per_cell[-1]
+        self._counters["assign_cells"] = ac
 
         return clusters
 
