@@ -1,0 +1,165 @@
+import os, io, time, boto3, gzip
+import msgpack
+from typing import List, Optional, Dict, Any
+from PIL import Image
+import pypdfium2 as pdfium
+from pypdfium2 import PdfPage
+from docling_parse.pdf_parser import DoclingPdfParser, PdfDocument
+from docling_core.types.doc.page import SegmentedPdfPage
+from docling_core.types.doc import BoundingBox, Size, CoordOrigin
+
+from shared.page_serialization import pack_segmented_page
+
+
+class PreprocessingPipeline:
+
+    # Layout model operates at ~144 DPI. We render a 2x image (for the model)
+    # and a 1x image (for display). To avoid blowing up on high-res PDFs
+    # (e.g. NVIDIA investor decks at 2880x1620 pts), we cap the 2x image at
+    # MAX_2X_PIXELS on its longest side and derive the render scale from that.
+    #
+    # Standard PDF (612x792 pts): scale = min(2.0, 1536/792) = 1.94 → ~1190x1540px
+    # High-res PDF (2880x1620 pts): scale = min(2.0, 1536/2880) = 0.53 → ~1536x864px
+    MAX_2X_PIXELS = 1536
+
+    def __init__(self, user_id: str):
+        self.user_id = user_id
+        self.stage = os.environ.get('STAGE', 'dev')
+        self.bucket = os.environ["DOCUMENTS_BUCKET"]
+
+        self.s3_client = boto3.client("s3")
+
+    def process_batch(self, job_id: str, start_page: int, end_page: int, total_pages: int):
+        """Processes a batch of pages"""
+        t0 = time.time()
+        file_bytes = self._load_from_s3(job_id=job_id)
+        t_s3 = time.time()
+
+        pdoc = pdfium.PdfDocument(io.BytesIO(file_bytes))
+        t_pdfium = time.time()
+        parser = DoclingPdfParser(loglevel="fatal")
+        t_parser_init = time.time()
+        dp_doc: PdfDocument = parser.load(path_or_stream=io.BytesIO(file_bytes))
+        t_load = time.time()
+        print(f"LOAD_DETAIL pdfium={t_pdfium-t_s3:.3f}s parser_init={t_parser_init-t_pdfium:.3f}s "
+              f"docling_load={t_load-t_parser_init:.3f}s pdf_size={len(file_bytes)/1024:.0f}KB")
+
+        pages = self._preprocess_page_batch(pdoc=pdoc, dp_doc=dp_doc, start_page=start_page, end_page=end_page)
+        t_preprocess = time.time()
+
+        batch_s3_key = self._upload_pages_to_s3(job_id, pages, start_page, end_page)
+        t_upload = time.time()
+
+        print(f"TIMING s3_get={t_s3-t0:.3f}s pdf_load={t_load-t_s3:.3f}s "
+              f"preprocess={t_preprocess-t_load:.3f}s s3_put={t_upload-t_preprocess:.3f}s "
+              f"total={t_upload-t0:.3f}s pages={start_page}-{end_page}")
+
+        return {
+            "batch_key": batch_s3_key,
+            "start_page": start_page,
+            "end_page": end_page
+        }
+
+    def _preprocess_page_batch(self, pdoc: pdfium.PdfDocument, dp_doc: PdfDocument, start_page: int, end_page: int) -> \
+    List[Dict[str, Any]]:
+        """Segment a page range, calculate the size, and generate images"""
+        out: List[Dict[str, Any]] = []
+
+        for page_no in range(start_page, end_page + 1):
+            t0 = time.time()
+
+            seg = self._parse_page(dp_doc, page_no)
+            t_parse = time.time()
+
+            pdf_page = pdoc[page_no]
+            size = self._get_size(pdf_page)
+
+            long_side = max(size.width, size.height)
+            scale_2x = min(2.0, self.MAX_2X_PIXELS / long_side)
+
+            img2 = self._get_page_image(pdf_page, size, scale=scale_2x, cropbox=None)
+            t_render = time.time()
+
+            img1 = img2.resize((img2.width // 2, img2.height // 2), Image.Resampling.LANCZOS)
+
+            img2_webp = self._convert_to_webp(img=img2)
+            img1_webp = self._convert_to_webp(img=img1)
+            t_encode = time.time()
+
+            seg_packed = pack_segmented_page(seg)
+            t_pack = time.time()
+
+            print(f"PAGE {page_no} parse={t_parse-t0:.3f}s render={t_render-t_parse:.3f}s "
+                  f"encode={t_encode-t_render:.3f}s pack={t_pack-t_encode:.3f}s "
+                  f"img={img2.width}x{img2.height} scale={scale_2x:.2f}")
+
+            page = {
+                "page_index": page_no,
+                "size": {"w": size.width, "h": size.height},
+                "segmented": seg_packed,
+                "images": {1: img1_webp.getvalue(), 2: img2_webp.getvalue()},
+            }
+            out.append(page)
+
+        return out
+
+    @staticmethod
+    def _parse_page(doc: PdfDocument, page_no: int) -> SegmentedPdfPage:
+        """Parses the page and returns a segmented PDF page"""
+        seg = doc.get_page(page_no + 1, create_words=True, create_textlines=True)
+
+        H = seg.dimension.height
+        for cells in (seg.textline_cells, seg.char_cells, seg.word_cells):
+            for tc in cells:
+                tc.to_top_left_origin(H)
+
+        return seg
+
+    @staticmethod
+    def _get_size(page: PdfPage) -> Size:
+        return Size(width=page.get_width(), height=page.get_height())
+
+    @staticmethod
+    def _get_page_image(page: PdfPage, page_size: Size, scale: float = 1,
+                        cropbox: Optional[BoundingBox] = None) -> Image.Image:
+        if not cropbox:
+            cropbox = BoundingBox(l=0, r=page_size.width, t=0, b=page_size.height, coord_origin=CoordOrigin.TOPLEFT)
+            padbox = BoundingBox(l=0, r=0, t=0, b=0, coord_origin=CoordOrigin.BOTTOMLEFT)
+        else:
+            padbox = cropbox.to_bottom_left_origin(page_size.height).model_copy()
+            padbox.r = page_size.width - padbox.r
+            padbox.t = page_size.height - padbox.t
+
+        img = page.render(scale=scale, rotation=0, crop=padbox.as_tuple()).to_pil()
+
+        return img.resize(size=(round(cropbox.width * scale), round(cropbox.height * scale)))
+
+    @staticmethod
+    def _convert_to_webp(img: Image.Image) -> io.BytesIO:
+        """Converts the image to webp. Uses lossy quality=90 + method=1 (fast)
+        since these are transit images for the GPU layout model, not archival."""
+        mode = "RGB" if img.mode not in ("L", "RGB", "RGBA") else img.mode
+        if img.mode != mode:
+            img = img.convert(mode)
+        buf = io.BytesIO()
+        img.save(buf, format="WEBP", quality=90, method=1)
+        buf.seek(0)
+
+        return buf
+
+    def _load_from_s3(self, job_id: str) -> bytes:
+        """Loads the file from S3"""
+        s3_key = f"uploads/{self.user_id}/{job_id}/source.pdf"
+
+        response = self.s3_client.get_object(Bucket=self.bucket, Key=s3_key)
+        return response['Body'].read()
+
+    def _upload_pages_to_s3(self, job_id: str, pages: List[Dict[str, Any]], start_page: int, end_page: int) -> str:
+        """Upload the page range to S3"""
+        packed = msgpack.packb(pages, use_bin_type=True)
+        blob = gzip.compress(packed, compresslevel=6)
+
+        key = f"batches/{self.user_id}/{job_id}/pages_{start_page}_{end_page}.bin"
+        self.s3_client.put_object(Bucket=self.bucket, Key=key, Body=blob,
+                                  ContentType="application/octet-stream")
+        return key

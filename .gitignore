@@ -1,0 +1,25 @@
+*.swp
+package-lock.json
+__pycache__
+.pytest_cache
+.venv
+*.egg-info
+.DS_Store
+.idea/
+
+# Compiled extensions
+*.so
+*.dylib
+*.a
+
+# Build artifacts
+shared/docling_parse/build/
+shared/docling_parse/externals/
+shared/docling_parse/test-deploy.zip
+
+# CDK asset staging directory
+.cdk.staging
+cdk.out
+
+# Local notes
+QUESTIONS.md

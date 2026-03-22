@@ -1,0 +1,51 @@
+FROM public.ecr.aws/lambda/python:3.13 AS builder
+
+# Install build dependencies
+RUN microdnf update -y && microdnf install -y \
+    gcc-c++ cmake make zlib-devel git && microdnf clean all
+
+WORKDIR /build
+
+# Copy requirements first (for layer caching)
+COPY lambdas/process_page_batch/requirements.txt .
+
+# Install Python build tools
+RUN python3.13 -m pip install --upgrade pip && \
+    python3.13 -m pip install --no-cache-dir \
+      "pybind11>=2.13.6" "cmake>=3.27.0" "setuptools>=77.0.3" "wheel>=0.43.0" "build>=1.2.1"
+
+# Install runtime dependencies
+RUN python3.13 -m pip install --no-cache-dir -t /tmp/site -r requirements.txt
+
+# Copy ONLY docling_parse first (for better caching of C++ build)
+COPY shared/docling_parse /docling_parse
+
+# Build docling_parse using its build.py script and copy manually
+# This properly creates the pdf_parsers.so with pdf_parser_v2 and pdf_sanitizer
+RUN cd /docling_parse && \
+    rm -rf build/ docling_parse/*.so && \
+    python3.13 build.py && \
+    cp -r docling_parse /tmp/site/
+
+# NOW copy docling_core (changes here won't invalidate C++ build cache)
+# Note: nested structure - code is in shared/docling_core/docling_core/
+COPY shared/docling_core/docling_core /docling_core
+
+# Install docling_core (pure Python - just copy the files)
+RUN cp -r /docling_core /tmp/site/
+
+# Copy page_serialization module
+COPY shared/page_serialization.py /tmp/site/shared/__init__.py
+RUN touch /tmp/site/shared/__init__.py
+COPY shared/page_serialization.py /tmp/site/shared/page_serialization.py
+
+# Final stage - output for CDK
+FROM alpine:latest AS output
+
+# CDK expects everything in /asset/
+COPY --from=builder /tmp/site /asset
+COPY lambdas/process_page_batch/handler.py /asset
+COPY lambdas/process_page_batch/preprocessing_pipeline.py /asset
+
+# Dummy command for CDK's docker create
+CMD ["echo", "Lambda code built successfully"]
