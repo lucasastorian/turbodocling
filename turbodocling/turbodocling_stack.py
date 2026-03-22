@@ -82,7 +82,7 @@ class TurboStack(Stack):
                 "user_id.$": "$.user_id",
                 "total_pages.$": "$.total_pages",
                 "batch_size.$": "$.batch_size",
-                "start_pages.$": "States.ArrayRange(0, States.MathAdd($.total_pages, -1), $.batch_size)",
+                "page_indices.$": "States.ArrayRange(0, States.MathAdd($.total_pages, -1), $.batch_size)",
             },
         )
 
@@ -100,10 +100,9 @@ class TurboStack(Stack):
 
         process_batches = sfn.Map(
             self, "ProcessBatches",
-            comment="Process PDF page batches in parallel",
-            items_path="$.start_pages",
+            items_path="$.page_indices",
             max_concurrency=40,
-            item_selector={
+            parameters={
                 "job_id.$": "$.job_id",
                 "user_id.$": "$.user_id",
                 "start_page.$": "$$.Map.Item.Value",
@@ -113,7 +112,7 @@ class TurboStack(Stack):
             result_path="$.parts",
         )
 
-        process_batches.item_processor(process_batch_task)
+        process_batches.iterator(process_batch_task)
 
         send_to_gpu = tasks.SqsSendMessage(
             self, "SendToGPU",

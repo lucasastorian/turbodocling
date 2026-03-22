@@ -212,13 +212,11 @@ class ReadingOrderPredictor:
         r"""
         Reorder the output of the
         """
+        import time
 
         self.initialise()
 
-        """
-        for i, elem in enumerate(page_elements):
-            print(f"{i:6.2f}\t{str(elem)}")
-        """
+        t0 = time.perf_counter()
 
         for i, elem in enumerate(page_elements):
             page_elements[i] = elem.to_bottom_left_origin(  # type: ignore
@@ -229,22 +227,39 @@ class ReadingOrderPredictor:
 
         self._init_l2r_map(page_elements)
 
+        t1 = time.perf_counter()
         self._init_ud_maps(page_elements)
+        t2 = time.perf_counter()
 
         if self.dilated_page_element:
             dilated_page_elements: List[PageElement] = copy.deepcopy(
                 page_elements
             )  # deep-copy
+            t3 = time.perf_counter()
             dilated_page_elements = self._do_horizontal_dilation(
                 page_elements, dilated_page_elements
             )
+            t4 = time.perf_counter()
 
             # redo with dilated provs
             self._init_ud_maps(dilated_page_elements)
+            t5 = time.perf_counter()
+        else:
+            t3 = t4 = t5 = t2
 
         self._find_heads(page_elements)
 
         self._sort_ud_maps(page_elements)
+        t6 = time.perf_counter()
+
+        n = len(page_elements)
+        if n > 5:
+            logging.info(
+                f"_predict_page: n={n} | init={1000*(t1-t0):.1f}ms ud1={1000*(t2-t1):.1f}ms "
+                f"deepcopy={1000*(t3-t2):.1f}ms dilation={1000*(t4-t3):.1f}ms "
+                f"ud2={1000*(t5-t4):.1f}ms heads+sort+order={1000*(t6-t5):.1f}ms "
+                f"total={1000*(t6-t0):.1f}ms"
+            )
 
         """
         print(f"heads: {self.heads}")

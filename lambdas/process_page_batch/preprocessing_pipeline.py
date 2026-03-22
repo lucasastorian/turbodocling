@@ -13,14 +13,7 @@ from shared.page_serialization import pack_segmented_page
 
 class PreprocessingPipeline:
 
-    # Layout model operates at ~144 DPI. We render a 2x image (for the model)
-    # and a 1x image (for display). To avoid blowing up on high-res PDFs
-    # (e.g. NVIDIA investor decks at 2880x1620 pts), we cap the 2x image at
-    # MAX_2X_PIXELS on its longest side and derive the render scale from that.
-    #
-    # Standard PDF (612x792 pts): scale = min(2.0, 1536/792) = 1.94 → ~1190x1540px
-    # High-res PDF (2880x1620 pts): scale = min(2.0, 1536/2880) = 0.53 → ~1536x864px
-    MAX_2X_PIXELS = 1536
+    MAX_2X_PIXELS = 3200
 
     def __init__(self, user_id: str):
         self.user_id = user_id
@@ -136,13 +129,12 @@ class PreprocessingPipeline:
 
     @staticmethod
     def _convert_to_webp(img: Image.Image) -> io.BytesIO:
-        """Converts the image to webp. Uses lossy quality=90 + method=1 (fast)
-        since these are transit images for the GPU layout model, not archival."""
+        """Converts the image to webp."""
         mode = "RGB" if img.mode not in ("L", "RGB", "RGBA") else img.mode
         if img.mode != mode:
             img = img.convert(mode)
         buf = io.BytesIO()
-        img.save(buf, format="WEBP", quality=90, method=1)
+        img.save(buf, format="WEBP", lossless=True, method=6)
         buf.seek(0)
 
         return buf

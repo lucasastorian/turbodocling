@@ -354,13 +354,20 @@ class ReadingOrderModel:
         new_item.prov.append(prov)
 
     def __call__(self, conv_res: ConversionResult) -> DoclingDocument:
-        with TimeRecorder(conv_res, "reading_order", scope=ProfilingScope.DOCUMENT):
-            page_elements = self._assembled_to_readingorder_elements(conv_res)
+        import time
+        import logging
+        _log = logging.getLogger(__name__)
 
-            # Apply reading order
+        with TimeRecorder(conv_res, "reading_order", scope=ProfilingScope.DOCUMENT):
+            t0 = time.perf_counter()
+            page_elements = self._assembled_to_readingorder_elements(conv_res)
+            t1 = time.perf_counter()
+
             sorted_elements = self.ro_model.predict_reading_order(
                 page_elements=page_elements
             )
+            t2 = time.perf_counter()
+
             el_to_captions_mapping = self.ro_model.predict_to_captions(
                 sorted_elements=sorted_elements
             )
@@ -370,6 +377,7 @@ class ReadingOrderModel:
             el_merges_mapping = self.ro_model.predict_merges(
                 sorted_elements=sorted_elements
             )
+            t3 = time.perf_counter()
 
             docling_doc: DoclingDocument = self._readingorder_elements_to_docling_doc(
                 conv_res,
@@ -378,5 +386,13 @@ class ReadingOrderModel:
                 el_to_footnotes_mapping,
                 el_merges_mapping,
             )
+            t4 = time.perf_counter()
+
+        _log.info(
+            f"reading_order: elements={len(page_elements)} | "
+            f"to_ro_elems={1000*(t1-t0):.0f}ms predict={1000*(t2-t1):.0f}ms "
+            f"captions_footnotes_merges={1000*(t3-t2):.0f}ms doc_reconstruct={1000*(t4-t3):.0f}ms "
+            f"total={1000*(t4-t0):.0f}ms"
+        )
 
         return docling_doc

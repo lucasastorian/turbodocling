@@ -42,6 +42,11 @@ s3_key = f"uploads/{user_id}/{job_id}/source.pdf"
 s3.upload_file(str(PDF_PATH), bucket, s3_key)
 print(f"Uploaded to s3://{bucket}/{s3_key}")
 
+# Compute batch_size to fit within one Map wave (max 40 concurrency)
+import math
+batch_size = max(1, math.ceil(total_pages / 40))
+print(f"batch_size={batch_size} ({math.ceil(total_pages / batch_size)} Lambda invocations)")
+
 # Start execution
 t_start = time.time()
 execution = sfn.start_execution(
@@ -51,7 +56,7 @@ execution = sfn.start_execution(
         "job_id": job_id,
         "user_id": user_id,
         "total_pages": total_pages,
-        "batch_size": 3,
+        "batch_size": batch_size,
     }),
 )
 execution_arn = execution["executionArn"]
