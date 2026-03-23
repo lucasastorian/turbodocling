@@ -99,10 +99,9 @@ sfn.start_execution(
 
 ## How Docling Works (and Why It's Slow)
 
-To understand what we changed, you need to understand the pipeline. Docling processes every page through seven stages, **serially**, one page at a time, start to finish, before touching the next:
+To understand what we changed, you need to understand the pipeline. Docling processes pages through seven stages:
 
 ```
-For each page:
   1. Parse         →  C++ PDF parser extracts text cells, fonts, coordinates
   2. Render        →  pdfium renders a page image for the vision models
   3. Layout Model  →  RT-DETR detects tables, figures, headers, text blocks
@@ -112,57 +111,35 @@ For each page:
   7. Assembly      →  Stitch everything into final Markdown + structured JSON
 ```
 
-Every stage runs on the same machine. CPU-bound parsing and GPU-bound inference share a single thread. The GPU sits idle while the CPU parses, and vice versa. Time scales linearly with page count.
+Docling does batch pages in small chunks (default 4) for the model stages, but all stages still run on the same machine. CPU-bound parsing and GPU-bound inference are coupled together, so the GPU sits idle during parsing and vice versa.
 
-We made significant optimizations at **every layer** of this pipeline. Here's what was wrong and what we did about it.
+We optimized at every layer. Three changes account for most of the speedup.
 
-### 1-2. Parse & Render — Wrong Machine, Wrong Architecture
+### 1. CPU/GPU Decoupling
 
-**The problem:** PDF parsing and image rendering are pure CPU work (string processing, font decoding, pixel rendering). Stock Docling runs all of this on the GPU instance, serially, one page at a time. You're paying A10G rates (~$1/hr) for work that doesn't touch the GPU.
+PDF parsing and image rendering are pure CPU work (string processing, font decoding, pixel rendering). Stock Docling runs all of this on the GPU instance. You're paying A10G rates (~$1/hr) for work that doesn't touch the GPU.
 
-**What we did:** We moved all CPU work off the GPU entirely. A Step Function fans out to **up to 40 parallel Lambda functions** (ARM64, 1769 MB, SnapStart), each parsing and rendering a batch of pages simultaneously. An 80-page doc that took ~40 seconds to parse serially now finishes in ~5 seconds wall-clock, bounded by the slowest Lambda rather than the sum.
+We moved all CPU work off the GPU entirely. A Step Function fans out to **up to 40 parallel Lambda functions** (ARM64, 1769 MB, SnapStart), each parsing and rendering a batch of pages simultaneously. An 80-page doc that took ~40 seconds to parse serially now finishes in ~5 seconds wall-clock, bounded by the slowest Lambda rather than the sum.
 
 ```
                     ┌─ Lambda 1:  pages 1-2   [parse + render] ─┐
                     ├─ Lambda 2:  pages 3-4   [parse + render] ─┤
 PDF → Step Function ├─ Lambda 3:  pages 5-6   [parse + render] ─┼→ SQS → GPU Worker
-                    ├─ ...                                      │   (steps 3-7 only)
+                    ├─ ...                                      │   (inference only)
                     └─ Lambda 40: pages 79-80 [parse + render] ─┘
 ```
 
 The GPU worker receives pre-parsed pages and runs **only** inference and postprocessing. No CPU-bound work to stall the pipeline.
 
-We also optimized the parser itself. Our custom fork of [docling-parse](https://github.com/DS4SD/docling-parse) includes targeted C++ patches: skipping path operators the downstream pipeline never uses (3x speedup on graphics-heavy pages), eliminating per-row header lookups in hot loops, and passing operator arguments by const reference instead of by value.
+### 2. TableFormer Rewrite
 
-### Transport — Getting Pages to the GPU Efficiently
-
-Pages cross the Lambda → GPU boundary as binary blobs. At 40x fan-out, every byte matters.
-
-Instead of shipping per-cell JSON objects, we pack all coordinates into columnar arrays (all x0 values together, all y0 together, etc.), which compresses ~3x better under gzip and enables zero-copy `np.frombuffer()` deserialization on the GPU side. Repeated strings (font names, text content) are deduplicated into a string table; each cell stores a 2-byte index instead of the full string. On the GPU side, cells stay columnar and are materialized into Python objects only on demand, avoiding tens of thousands of throwaway allocations.
-
-Wire format is msgpack → gzip. An 80-page batch compresses to ~2-3 MB.
-
-### 3. Layout Model — Same Model, Better Execution
-
-**The problem:** The RT-DETR layout model is good; the issue is how it's called. Stock Docling runs inference one page at a time with dynamic input shapes, which prevents the GPU from batching efficiently or leveraging hardware-level optimizations.
-
-**What we did:** Same checkpoint, same detection heads, no model changes. We batch all pages into fixed 640×640 tensors (batches of 32), enable TF32 matmul and channels-last memory format for Ampere GPUs, and run image preprocessing (normalization, resize, padding) on GPU with persistent CUDA streams so H2D transfers overlap with compute.
-
-### 4. Layout Postprocessing — Death by Python Loop
-
-**The problem:** Layout postprocessing converts raw predictions into structured page elements (coordinate transforms, NMS, reading order, spatial clustering). Stock Docling rebuilds spatial indices **from scratch on every page**. On the Apple 10-K, it reconstructs the valid-cell list 80 times at 154ms each, wasting 12 seconds on redundant work.
-
-**What we did:** Precompute all geometry once. Valid-cell lists, bounding boxes, and areas are built in `__init__()` and reused across every page. Cell-to-cluster assignment uses a grid index for O(1) spatial lookup instead of brute-force intersection testing. Overlap detection uses numpy broadcasting instead of per-pair Python loops.
-
-### 5-6. TableFormer — The Biggest Win
-
-**The problem:** This is where stock Docling is most wasteful. TableFormer is an autoregressive transformer that predicts table structure token by token, like a language model. Stock Docling's implementation has three compounding problems:
+This is where stock Docling is most wasteful. TableFormer is an autoregressive transformer that predicts table structure token by token, like a language model. Stock Docling's implementation has three compounding problems:
 
 - **No batching.** Tables are processed one at a time. A page with 5 tables runs 5 separate inference passes.
 - **No KV cache.** Every decode step re-attends to all previous tokens from scratch. This is the O(T²) pattern that the LLM world solved years ago with KV caching.
 - **Inline execution.** Stock Docling already had separate helper classes for matching and postprocessing, but executed them inline in the same call path, so the GPU blocks on CPU work between tables.
 
-**What we did:** We rewrote the entire TableFormer inference path.
+We rewrote the entire inference path:
 
 **KV-cached decoding:** We preallocate key/value buffers to `max_pred_len` and write in-place each step. O(T) memory, zero allocations after init. Cross-attention K/V are precomputed once from the encoder output and reused across all decode steps.
 
@@ -172,15 +149,21 @@ Wire format is msgpack → gzip. An 80-page batch compresses to ~2-3 MB.
 
 **Additional optimizations:** Fused QKV projections (one GEMM instead of three per attention head), streaming softmax for bbox inference (constant peak memory regardless of image resolution), BF16 for transformer layers with FP32 retained for precision-sensitive bbox regression, and Conv+BN fusion with optional CUDA graph capture for the ResNet-18 encoder.
 
-### 7. Assembly — Small Wins That Add Up
+### 3. Layout Postprocessing
 
-**The problem:** Stock Docling instantiates a new Markdown serializer per table (re-scanning the full document tree each time) and redundantly re-encodes images that are already stored as base64 data URIs.
+Layout postprocessing converts raw predictions into structured page elements (coordinate transforms, NMS, reading order, spatial clustering). Stock Docling rebuilds spatial indices **from scratch on every page**. On the Apple 10-K, it reconstructs the valid-cell list 80 times at 154ms each, wasting 12 seconds on redundant work.
 
-**What we did:** Serializer reuse across all tables, direct base64 extraction from data URIs (skipping ~400ms of redundant PNG re-encoding on image-heavy docs), and targeted iteration over `document.pictures` instead of full tree traversal.
+We precompute all geometry once. Valid-cell lists, bounding boxes, and areas are built in `__init__()` and reused across every page. Cell-to-cluster assignment uses a grid index for O(1) spatial lookup instead of brute-force intersection testing. Overlap detection uses numpy broadcasting instead of per-pair Python loops.
 
-### The GPU Pipeline — All Together
+### Other Optimizations
 
-These optimizations compound. Here's the GPU worker's time breakdown on the Apple 10-K (80 pages), after receiving pre-parsed pages from Lambda:
+- **C++ parser patches:** Custom fork of [docling-parse](https://github.com/DS4SD/docling-parse). Skip path operators the downstream pipeline never uses (3x speedup on graphics-heavy pages), eliminate per-row header lookups in hot loops, pass operator arguments by const reference instead of by value.
+- **Layout model execution:** Stock Docling already batches layout inference, but in small dynamic batches (typically 4) with default preprocessing. Same RT-DETR checkpoint and heads, but we run fixed-size 640x640 batches of 32, channels-last + TF32 on Ampere, and GPU preprocessing with persistent streams to overlap H2D and compute.
+- **Columnar page transport:** Pages cross the Lambda/GPU boundary as columnar msgpack+gzip blobs (~2-3 MB for 80 pages). Zero-copy `np.frombuffer()` deserialization, string interning, lazy cell materialization.
+
+### GPU Pipeline Timing
+
+Here's the GPU worker's time breakdown on the Apple 10-K (80 pages), after receiving pre-parsed pages from Lambda:
 
 | Stage | Time |
 |---|---|
