@@ -14,8 +14,6 @@
 
 A lot of production applications need fast, high-quality PDF-to-Markdown conversion. A user uploads a document and you want to feed it into an LLM. Mistral OCR takes 20-30 seconds. vLLM-based pipelines are slow. Traditional parsers might not meet your quality bar.
 
-There's also a correctness issue. vLLM-based approaches are inherently probabilistic. They can hallucinate values. It's rare, but if you're extracting financial tables from SEC filings, "rare" isn't good enough. Docling's architecture avoids this: text and numbers come directly from the PDF parser (exact extraction), and the neural networks are only used for layout detection and table structure, not for reading the actual content on the page.
-
 Or you need to backfill a million pages and don't want to pay $0.015/page for AWS Textract or $0.01/page for Mistral OCR. At 10M pages, that's $100-150K just for extraction. If you're building an MVP, that math kills you.
 
 [Docling](https://github.com/DS4SD/docling) solves the quality problem. It properly extracts headers, paragraphs, tables, and images from PDFs without hallucinating values. But an 80-page 10-K takes **~67 seconds** on an A10G, with the GPU mostly idle. That makes it unusable for anything user-facing, and because it's slow, it's effectively expensive. Scaling it means spinning up a cluster of GPU instances and managing the infra yourself.
@@ -65,26 +63,23 @@ cdk deploy
 ### Process a PDF
 
 ```python
-import boto3, json, time, uuid
+import boto3, json, uuid
 import pypdfium2 as pdfium
 
-cfn = boto3.client("cloudformation")
+STEP_FUNCTION_ARN = "arn:aws:states:us-east-1:123456789:stateMachine:..."
+BUCKET = "turbodocling-turbo-dev-documentsbucket-..."
+
 s3 = boto3.client("s3")
 sfn = boto3.client("stepfunctions")
 
-# Get stack outputs
-outputs = {o["OutputKey"]: o["OutputValue"]
-           for o in cfn.describe_stacks(StackName="turbodocling-turbo-dev")["Stacks"][0]["Outputs"]}
-
 # Upload PDF
 job_id = str(uuid.uuid4())
-s3.upload_file("my_document.pdf", outputs["DocumentsBucketName"],
-               f"uploads/user/{job_id}/source.pdf")
+s3.upload_file("my_document.pdf", BUCKET, f"uploads/user/{job_id}/source.pdf")
 
-# Start processing — Step Function computes batch_size automatically
+# Start processing
 total_pages = len(pdfium.PdfDocument("my_document.pdf"))
 sfn.start_execution(
-    stateMachineArn=outputs["StateMachineArn"],
+    stateMachineArn=STEP_FUNCTION_ARN,
     name=f"job-{job_id[:8]}",
     input=json.dumps({
         "job_id": job_id,
@@ -220,34 +215,6 @@ The GPU worker is internally multi-threaded: dedicated threads for inference, la
 **GPU Worker (A10G, ECS):** Polls SQS, downloads batches, runs layout + table inference, assembles structured output (markdown + elements JSON).
 
 **Batch sizing:** `ceil(total_pages / 40)` pages per Lambda, so an 80-page doc fans out across 40 parallel invocations.
-
----
-
-## Build & Deploy
-
-```bash
-source .venv/bin/activate
-
-# Rebuild C++ parser after changes
-python shared/docling_parse/build.py
-pip install -e shared/docling_parse
-
-# Deploy
-cdk deploy
-
-# End-to-end smoke test
-python tests/smoke_test.py tests/golden/pdfs/attention.pdf
-
-# Local parser benchmark
-python tests/bench_parse.py --pdf apple_10k.pdf
-python tests/bench_parse.py --pdf attention.pdf --check    # compare against baseline
-python tests/bench_parse.py --update-golden                 # save new baseline
-
-# Trace last execution (Lambda + GPU timing breakdown)
-python tests/trace_job.py --latest 1
-```
-
-**Golden test PDFs** in `tests/golden/pdfs/`: Docling paper (8p), Attention Is All You Need (15p), Berkshire Hathaway letter (20p), AlphaGo Zero (42p), NVIDIA investor roadshow (15p), Apple 10-K (80p).
 
 ---
 
