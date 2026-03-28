@@ -15,6 +15,7 @@ namespace pdflib
     ~pdf_resource();
 
     nlohmann::json get();
+    nlohmann::json get_compact();
     bool init_from(nlohmann::json& data);
 
     void rotate(int angle, std::pair<double, double> delta);
@@ -34,6 +35,7 @@ namespace pdflib
   public:
 
     static std::vector<std::string> header;
+    static std::vector<std::string> compact_header;
 
     bool active;
     bool left_to_right;
@@ -136,6 +138,23 @@ namespace pdflib
     "left_to_right"
   };
 
+  std::vector<std::string> pdf_resource<PAGE_CELL>::compact_header = {
+    "r_x0",
+    "r_y0",
+    "r_x1",
+    "r_y1",
+    "r_x2",
+    "r_y2",
+    "r_x3",
+    "r_y3",
+    "text",
+    "rendering-mode",
+    "font-key",
+    "font-name",
+    "widget",
+    "left_to_right"
+  };
+
   void pdf_resource<PAGE_CELL>::rotate(int angle, std::pair<double, double> delta)
   {
     utils::values::rotate_inplace(angle, x0, y0);
@@ -189,6 +208,30 @@ namespace pdflib
       cell.push_back(left_to_right); // 20
     }
     assert(cell.size()==header.size());
+
+    return cell;
+  }
+
+  nlohmann::json pdf_resource<PAGE_CELL>::get_compact()
+  {
+    nlohmann::json cell;
+
+    cell.push_back(utils::values::round(r_x0)); // 0
+    cell.push_back(utils::values::round(r_y0)); // 1
+    cell.push_back(utils::values::round(r_x1)); // 2
+    cell.push_back(utils::values::round(r_y1)); // 3
+    cell.push_back(utils::values::round(r_x2)); // 4
+    cell.push_back(utils::values::round(r_y2)); // 5
+    cell.push_back(utils::values::round(r_x3)); // 6
+    cell.push_back(utils::values::round(r_y3)); // 7
+    cell.push_back(text);                       // 8
+    cell.push_back(rendering_mode);            // 9
+    cell.push_back(font_key);                  // 10
+    cell.push_back(font_name);                 // 11
+    cell.push_back(widget);                    // 12
+    cell.push_back(left_to_right);             // 13
+
+    assert(cell.size()==compact_header.size());
 
     return cell;
   }

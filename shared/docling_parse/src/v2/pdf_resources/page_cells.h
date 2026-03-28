@@ -17,6 +17,7 @@ namespace pdflib
     ~pdf_resource();
 
     nlohmann::json get();
+    nlohmann::json get_compact();
     bool init_from(nlohmann::json& data);
 
     void rotate(int angle, std::pair<double, double> delta);
@@ -59,6 +60,23 @@ namespace pdflib
     for(auto& item:cells)
       {
         data.push_back(item.get());
+      }
+
+    return result;
+  }
+
+  nlohmann::json pdf_resource<PAGE_CELLS>::get_compact()
+  {
+    nlohmann::json result;
+
+    result["header"] = pdf_resource<PAGE_CELL>::compact_header;
+
+    auto& data = result["data"];
+    data = nlohmann::json::array();
+
+    for(auto& item:cells)
+      {
+        data.push_back(item.get_compact());
       }
 
     return result;

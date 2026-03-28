@@ -244,6 +244,30 @@ PYBIND11_MODULE(pdf_parsers, m) {
     Returns:
         dict: The original page payload without document/page wrapper metadata.)")
 
+    .def("parse_pdf_from_key_on_page_original_compact",
+	 [](docling::docling_parser_v2 &self,
+	    const std::string &key,
+	    int page,
+	    const std::string &page_boundary,
+	    bool do_sanitization) -> nlohmann::json {
+	   return self.parse_pdf_from_key_on_page_original_compact(key, page, page_boundary, do_sanitization);
+	 },
+	 pybind11::arg("key"),
+	 pybind11::arg("page"),
+	 pybind11::arg("page_boundary") = "crop_box",
+	 pybind11::arg("do_sanitization") = true,
+	 R"(
+    Parse a specific page and return only the original page payload with compact cell rows.
+
+    Parameters:
+        key (str): The unique key of the document.
+        page (int): The page number to parse.
+        page_boundary (str): The page boundary specification for parsing [choices: crop_box, media_box].
+        do_sanitization: Sanitize the chars into lines [default=true].
+
+    Returns:
+        dict: The original page payload without wrapper metadata and with compact cell tables.)")
+
     .def("sanitize_cells",
 	 [](docling::docling_parser_v2 &self,
 	    nlohmann::json &original_cells,
@@ -423,6 +447,29 @@ Sanitize table cells with specified parameters and return the processed JSON.
 
     Returns:
         dict: A table-shaped JSON object with `header` and `data`.)")
+
+    .def("create_word_cells_table_compact",
+	 [](docling::docling_sanitizer &self,
+	    double horizontal_cell_tolerance,
+	    bool enforce_same_font,
+	    double space_width_factor_for_merge = 1.0) -> nlohmann::json {
+	   return self.create_word_cells_table_compact(horizontal_cell_tolerance,
+						       enforce_same_font,
+						       space_width_factor_for_merge);
+	 },
+	 pybind11::arg("horizontal_cell_tolerance")=1.0,
+	 pybind11::arg("enforce_same_font")=true,
+	 pybind11::arg("space_width_factor_for_merge")=0.33,
+	 R"(
+    Create word cells in compact table form
+
+    Parameters:
+        horizontal_cell_tolerance (float): Vertical adjustment parameter to judge if two cells need to be merged (yes if abs(cell_i.r_y1-cell_i.r_y0)<horizontal_cell_tolerance), default = 1.0.
+        enforce_same_font (bool): Whether to enforce the same font across cells. Default is True
+        space_width_factor_for_merge (float): Factor for merging cells based on space width. Default is 0.33.
+
+    Returns:
+        dict: A compact table-shaped JSON object with `header` and `data`.)")
     
     .def("create_line_cells",
 	 [](docling::docling_sanitizer &self,
@@ -476,7 +523,34 @@ Sanitize table cells with specified parameters and return the processed JSON.
         space_width_factor_for_merge_with_space (float): Factor for merging cells with space width. Default is 0.33.
 
     Returns:
-        dict: A table-shaped JSON object with `header` and `data`.)");  
+        dict: A table-shaped JSON object with `header` and `data`.)")
+
+    .def("create_line_cells_table_compact",
+	 [](docling::docling_sanitizer &self,
+	    double horizontal_cell_tolerance,
+	    bool enforce_same_font,
+	    double space_width_factor_for_merge = 1.0,
+	    double space_width_factor_for_merge_with_space = 0.33) -> nlohmann::json {
+	   return self.create_line_cells_table_compact(horizontal_cell_tolerance,
+						       enforce_same_font,
+						       space_width_factor_for_merge,
+						       space_width_factor_for_merge_with_space);
+	 },
+	 pybind11::arg("horizontal_cell_tolerance")=1.0,
+	 pybind11::arg("enforce_same_font")=true,
+	 pybind11::arg("space_width_factor_for_merge")=1.0,
+	 pybind11::arg("space_width_factor_for_merge_with_space")=0.33,
+	 R"(
+    Create line cells in compact table form
+
+    Parameters:
+        horizontal_cell_tolerance (float): Vertical adjustment parameter to judge if two cells need to be merged (yes if abs(cell_i.r_y1-cell_i.r_y0)<horizontal_cell_tolerance), default = 1.0.
+        enforce_same_font (bool): Whether to enforce the same font across cells. Default is True
+        space_width_factor_for_merge (float): Factor for merging cells based on space width. Default is 1.0.
+        space_width_factor_for_merge_with_space (float): Factor for merging cells with space width. Default is 0.33.
+
+    Returns:
+        dict: A compact table-shaped JSON object with `header` and `data`.)");  
     
     
 }

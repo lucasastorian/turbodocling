@@ -69,6 +69,10 @@ namespace pdflib
                                         std::string page_boundary,
                                         bool do_sanitization);
 
+    nlohmann::json decode_page_original_compact(int page_number,
+                                                std::string page_boundary,
+                                                bool do_sanitization);
+
   private:
 
     void update_qpdf_logger();
@@ -421,6 +425,48 @@ namespace pdflib
         std::fprintf(
           stderr,
           "[td-parser] mode=original-only page=%d decode_page=%.3fms page_get_original=%.3fms total=%.3fms\n",
+          page_number,
+          td_parser_profile_ms(decode_ns),
+          td_parser_profile_ms(get_ns),
+          1000.0 * timer.get_time());
+      }
+
+    return result;
+  }
+
+  nlohmann::json pdf_decoder<DOCUMENT>::decode_page_original_compact(int page_number,
+                                                                     std::string page_boundary,
+                                                                     bool do_sanitization)
+  {
+    utils::timer timer;
+    bool const profile_enabled = td_parser_profile_enabled();
+
+    std::vector<QPDFObjectHandle> pages = qpdf_document.getAllPages();
+    if(not (0<=page_number and page_number<pages.size()))
+      {
+        LOG_S(WARNING) << "page " << page_number << " is out of bounds ...";
+        return nlohmann::json::value_t::null;
+      }
+
+    pdf_decoder<PAGE> page_decoder(pages.at(page_number));
+
+    auto const decode_start =
+      profile_enabled ? td_parser_profile_clock::now() : td_parser_profile_clock::time_point{};
+    page_decoder.decode_page(page_boundary, do_sanitization);
+    auto const decode_ns =
+      profile_enabled ? td_parser_profile_ns(td_parser_profile_clock::now() - decode_start) : 0;
+
+    auto const get_start =
+      profile_enabled ? td_parser_profile_clock::now() : td_parser_profile_clock::time_point{};
+    auto result = page_decoder.get_original_compact();
+    auto const get_ns =
+      profile_enabled ? td_parser_profile_ns(td_parser_profile_clock::now() - get_start) : 0;
+
+    if(profile_enabled)
+      {
+        std::fprintf(
+          stderr,
+          "[td-parser] mode=original-compact page=%d decode_page=%.3fms page_get_original=%.3fms total=%.3fms\n",
           page_number,
           td_parser_profile_ms(decode_ns),
           td_parser_profile_ms(get_ns),

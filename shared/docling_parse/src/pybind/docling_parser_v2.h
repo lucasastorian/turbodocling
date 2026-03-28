@@ -60,6 +60,11 @@ namespace docling
                                                        std::string page_boundary,
                                                        bool do_sanitization);
 
+    nlohmann::json parse_pdf_from_key_on_page_original_compact(std::string key,
+                                                               int page,
+                                                               std::string page_boundary,
+                                                               bool do_sanitization);
+
     nlohmann::json sanitize_cells(nlohmann::json& original_cells,
 				  nlohmann::json& page_dim,
 				  nlohmann::json& page_lines,
@@ -420,6 +425,25 @@ namespace docling
     auto& decoder = itr->second;
 
     return decoder->decode_page_original(page, page_boundary, do_sanitization);
+  }
+
+  nlohmann::json docling_parser_v2::parse_pdf_from_key_on_page_original_compact(std::string key,
+                                                                                 int page,
+                                                                                 std::string page_boundary,
+                                                                                 bool do_sanitization)
+  {
+    LOG_S(INFO) << __FUNCTION__;
+
+    auto itr = key2doc.find(key);
+    if(itr==key2doc.end())
+      {
+        LOG_S(ERROR) << "key not found: " << key << " " << key2doc.count(key);
+        return nlohmann::json::value_t::null;
+      }
+
+    auto& decoder = itr->second;
+
+    return decoder->decode_page_original_compact(page, page_boundary, do_sanitization);
   }
 
   nlohmann::json docling_parser_v2::sanitize_cells(nlohmann::json& json_cells,

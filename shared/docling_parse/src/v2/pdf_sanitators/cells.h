@@ -108,7 +108,6 @@ namespace pdflib
     };
 
     std::unordered_map<duplicate_bucket_key, std::vector<int>, duplicate_bucket_hash> buckets;
-    bool erased_cell = false;
 
     for(int i=0; i<cells.size(); i++)
       {
@@ -148,7 +147,6 @@ namespace pdflib
                                        << "with r'_0: (" << cell.r_x0 << ", " << cell.r_y0 << ") "
                                        << "with r'_2: (" << cell.r_x2 << ", " << cell.r_y2 << ") ";
                         cells[i].active = false;
-                        erased_cell = true;
                         duplicate = true;
                         break;
                       }
