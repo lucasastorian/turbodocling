@@ -3,6 +3,8 @@
 #ifndef PYBIND_PDF_SANITIZER_H
 #define PYBIND_PDF_SANITIZER_H
 
+#include <algorithm>
+
 #include <v2.h>
 
 namespace docling
@@ -273,19 +275,13 @@ namespace docling
 
     LOG_S(INFO) << "#-word cells: " << word_cells.size();
     
-    // remove all spaces 
-    auto itr = word_cells.begin();
-    while(itr!=word_cells.end())
-      {
-	if(utils::string::is_space(itr->text))
-	  {
-	    itr = word_cells.erase(itr);	    
-	  }
-	else
-	  {
-	    itr++;
-	  }
-      }
+    auto new_end
+      = std::remove_if(word_cells.begin(),
+		       word_cells.end(),
+		       [](auto& cell) {
+			 return utils::string::is_space(cell.text);
+		       });
+    word_cells.erase(new_end, word_cells.end());
 
     LOG_S(INFO) << "#-word cells: " << word_cells.size();
     
@@ -311,18 +307,13 @@ namespace docling
 
     word_cells = char_cells;
 
-    auto itr = word_cells.begin();
-    while(itr!=word_cells.end())
-      {
-	if(utils::string::is_space(itr->text))
-	  {
-	    itr = word_cells.erase(itr);
-	  }
-	else
-	  {
-	    itr++;
-	  }
-      }
+    auto new_end
+      = std::remove_if(word_cells.begin(),
+		       word_cells.end(),
+		       [](auto& cell) {
+			 return utils::string::is_space(cell.text);
+		       });
+    word_cells.erase(new_end, word_cells.end());
 
     double space_width_factor_for_merge_with_space = 2.0*space_width_factor_for_merge;
 
