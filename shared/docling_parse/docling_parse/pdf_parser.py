@@ -404,6 +404,50 @@ class PdfDocument:
     def _load_text_cells(data: List[dict]) -> List[PdfTextCell]:
         return [PdfTextCell.model_validate(item) for item in data]
 
+    def _create_word_cells_from_sanitizer(
+        self,
+        sanitizer: "pdf_sanitizer",
+        *,
+        enforce_same_font: bool,
+    ) -> List[PdfTextCell]:
+        if hasattr(sanitizer, "create_word_cells_table"):
+            return self._to_cells(
+                sanitizer.create_word_cells_table(
+                    space_width_factor_for_merge=0.33,
+                    enforce_same_font=enforce_same_font,
+                )
+            )
+
+        return self._load_text_cells(
+            sanitizer.create_word_cells(
+                space_width_factor_for_merge=0.33,
+                enforce_same_font=enforce_same_font,
+            )
+        )
+
+    def _create_line_cells_from_sanitizer(
+        self,
+        sanitizer: "pdf_sanitizer",
+        *,
+        enforce_same_font: bool,
+    ) -> List[PdfTextCell]:
+        if hasattr(sanitizer, "create_line_cells_table"):
+            return self._to_cells(
+                sanitizer.create_line_cells_table(
+                    space_width_factor_for_merge=1.0,
+                    space_width_factor_for_merge_with_space=0.33,
+                    enforce_same_font=enforce_same_font,
+                )
+            )
+
+        return self._load_text_cells(
+            sanitizer.create_line_cells(
+                space_width_factor_for_merge=1.0,
+                space_width_factor_for_merge_with_space=0.33,
+                enforce_same_font=enforce_same_font,
+            )
+        )
+
     def _to_segmented_page(
         self,
         page: dict,
@@ -416,11 +460,8 @@ class PdfDocument:
 
         t0 = _t.time()
         needs_char_data = create_words or create_textlines
-        if needs_char_data:
-            char_cells, char_data = self._to_cells(page["cells"], with_char_data=True)
-        else:
-            char_cells = self._to_cells(page["cells"])
-            char_data = None
+        char_cells = self._to_cells(page["cells"])
+        char_data = page["cells"]["data"] if needs_char_data else None
         t1 = _t.time()
 
         segmented_page = SegmentedPdfPage(
@@ -442,22 +483,17 @@ class PdfDocument:
             sanitizer.set_char_cells(data=char_data)
 
         if create_words and sanitizer is not None:
-            segmented_page.word_cells = self._load_text_cells(
-                sanitizer.create_word_cells(
-                    space_width_factor_for_merge=0.33,
-                    enforce_same_font=enforce_same_font,
-                )
+            segmented_page.word_cells = self._create_word_cells_from_sanitizer(
+                sanitizer,
+                enforce_same_font=enforce_same_font,
             )
             segmented_page.has_words = len(segmented_page.word_cells) > 0
         t4 = _t.time()
 
         if create_textlines and sanitizer is not None:
-            segmented_page.textline_cells = self._load_text_cells(
-                sanitizer.create_line_cells(
-                    space_width_factor_for_merge=1.0,
-                    space_width_factor_for_merge_with_space=0.33,
-                    enforce_same_font=enforce_same_font,
-                )
+            segmented_page.textline_cells = self._create_line_cells_from_sanitizer(
+                sanitizer,
+                enforce_same_font=enforce_same_font,
             )
             segmented_page.has_lines = len(segmented_page.textline_cells) > 0
         t5 = _t.time()
@@ -492,12 +528,20 @@ class PdfDocument:
         sanitizer.set_char_cells(data=char_data)
 
         # data = sanitizer.create_word_cells(space_width_factor_for_merge=0.33)
-        segmented_page.word_cells = self._load_text_cells(
-            sanitizer.create_word_cells(
-                space_width_factor_for_merge=space_width_factor_for_merge,
-                enforce_same_font=enforce_same_font,
+        if hasattr(sanitizer, "create_word_cells_table"):
+            segmented_page.word_cells = self._to_cells(
+                sanitizer.create_word_cells_table(
+                    space_width_factor_for_merge=space_width_factor_for_merge,
+                    enforce_same_font=enforce_same_font,
+                )
             )
-        )
+        else:
+            segmented_page.word_cells = self._load_text_cells(
+                sanitizer.create_word_cells(
+                    space_width_factor_for_merge=space_width_factor_for_merge,
+                    enforce_same_font=enforce_same_font,
+                )
+            )
 
         segmented_page.has_words = len(segmented_page.word_cells) > 0
 
@@ -522,13 +566,22 @@ class PdfDocument:
         sanitizer.set_char_cells(data=char_data)
 
         # data = sanitizer.create_line_cells()
-        segmented_page.textline_cells = self._load_text_cells(
-            sanitizer.create_line_cells(
-                space_width_factor_for_merge=space_width_factor_for_merge,
-                space_width_factor_for_merge_with_space=space_width_factor_for_merge_with_space,
-                enforce_same_font=enforce_same_font,
+        if hasattr(sanitizer, "create_line_cells_table"):
+            segmented_page.textline_cells = self._to_cells(
+                sanitizer.create_line_cells_table(
+                    space_width_factor_for_merge=space_width_factor_for_merge,
+                    space_width_factor_for_merge_with_space=space_width_factor_for_merge_with_space,
+                    enforce_same_font=enforce_same_font,
+                )
             )
-        )
+        else:
+            segmented_page.textline_cells = self._load_text_cells(
+                sanitizer.create_line_cells(
+                    space_width_factor_for_merge=space_width_factor_for_merge,
+                    space_width_factor_for_merge_with_space=space_width_factor_for_merge_with_space,
+                    enforce_same_font=enforce_same_font,
+                )
+            )
 
         segmented_page.has_lines = len(segmented_page.textline_cells) > 0
 

@@ -143,9 +143,17 @@ namespace pdflib
   {
     utils::timer timer;
 
-    json_page = to_json(qpdf_page);
+    {
+      utils::timer phase_timer;
+      json_page = to_json(qpdf_page);
+      timings["to_json_page"] = phase_timer.get_time();
+    }
 
-    json_annots = extract_annots_in_json(qpdf_page);
+    {
+      utils::timer phase_timer;
+      json_annots = extract_annots_in_json(qpdf_page);
+      timings["extract_page_annots_json"] = phase_timer.get_time();
+    }
     
     try
       {
@@ -165,23 +173,31 @@ namespace pdflib
 
     decode_annots();
     
-    rotate_contents();
+    {
+      utils::timer phase_timer;
+      rotate_contents();
+      timings["rotate_contents"] = phase_timer.get_time();
+    }
 
     // fix the orientiation
     {
+      utils::timer phase_timer;
       pdf_sanitator<PAGE_DIMENSION> sanitator(page_dimension);      
 
       sanitator.sanitize(page_boundary); // update the top-level bbox            
       sanitator.sanitize(page_cells, page_boundary);            
       sanitator.sanitize(page_lines, page_boundary);            
       sanitator.sanitize(page_images, page_boundary);            
+      timings["sanitize_page_geometry"] = phase_timer.get_time();
     }
 
     {
+      utils::timer phase_timer;
       pdf_sanitator<PAGE_CELLS> sanitator;
       
       sanitator.remove_duplicate_chars(page_cells, 0.5);      
       sanitator.sanitize_text(page_cells);
+      timings["sanitize_original_chars"] = phase_timer.get_time();
     }
     
     if(do_sanitization)

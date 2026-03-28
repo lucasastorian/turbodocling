@@ -25,11 +25,18 @@ namespace docling
     nlohmann::json create_word_cells(double horizontal_cell_tolerance=1.00,
 				     bool enforce_same_font=true,
 				     double space_width_factor_for_merge=0.05);
+    nlohmann::json create_word_cells_table(double horizontal_cell_tolerance=1.00,
+					   bool enforce_same_font=true,
+					   double space_width_factor_for_merge=0.05);
 
     nlohmann::json create_line_cells(double horizontal_cell_tolerance=1.00,
 				     bool enforce_same_font=true,
 				     double space_width_factor_for_merge=1.00,
 				     double space_width_factor_for_merge_with_space=0.33);
+    nlohmann::json create_line_cells_table(double horizontal_cell_tolerance=1.00,
+					   bool enforce_same_font=true,
+					   double space_width_factor_for_merge=1.00,
+					   double space_width_factor_for_merge_with_space=0.33);
     
   private:
 
@@ -107,51 +114,58 @@ namespace docling
     
     if(data.is_array())
       {
-	char_cells.clear();
-	
-	for(auto& item:data)
+	if(data.empty() or data.front().is_array())
 	  {
-	    pdflib::pdf_resource<pdflib::PAGE_CELL> char_cell;
+	    char_cells.init_from(data);
+	  }
+	else
+	  {
+	    char_cells.clear();
+	
+	    for(auto& item:data)
+	      {
+		pdflib::pdf_resource<pdflib::PAGE_CELL> char_cell;
 
-	    {
-	      char_cell.active = true;
+		{
+		  char_cell.active = true;
 	    
-	      char_cell.r_x0 = item.at("rect").at("r_x0").get<double>();
-	      char_cell.r_y0 = item.at("rect").at("r_y0").get<double>();
+		  char_cell.r_x0 = item.at("rect").at("r_x0").get<double>();
+		  char_cell.r_y0 = item.at("rect").at("r_y0").get<double>();
 
-	      char_cell.r_x1 = item.at("rect").at("r_x1").get<double>();
-	      char_cell.r_y1 = item.at("rect").at("r_y1").get<double>();
+		  char_cell.r_x1 = item.at("rect").at("r_x1").get<double>();
+		  char_cell.r_y1 = item.at("rect").at("r_y1").get<double>();
 
-	      char_cell.r_x2 = item.at("rect").at("r_x2").get<double>();
-	      char_cell.r_y2 = item.at("rect").at("r_y2").get<double>();
+		  char_cell.r_x2 = item.at("rect").at("r_x2").get<double>();
+		  char_cell.r_y2 = item.at("rect").at("r_y2").get<double>();
 
-	      char_cell.r_x3 = item.at("rect").at("r_x3").get<double>();
-	      char_cell.r_y3 = item.at("rect").at("r_y3").get<double>();
+		  char_cell.r_x3 = item.at("rect").at("r_x3").get<double>();
+		  char_cell.r_y3 = item.at("rect").at("r_y3").get<double>();
 
-	      /*
-	      char_cell.x0
-		= std::min(char_cell.r_x0, std::min(char_cell.r_x1, std::min(char_cell.r_x2, char_cell.r_x3)));
-	      char_cell.y0
-		= std::min(char_cell.r_y0, std::min(char_cell.r_y1, std::min(char_cell.r_y2, char_cell.r_y3)));
+		  /*
+		  char_cell.x0
+		    = std::min(char_cell.r_x0, std::min(char_cell.r_x1, std::min(char_cell.r_x2, char_cell.r_x3)));
+		  char_cell.y0
+		    = std::min(char_cell.r_y0, std::min(char_cell.r_y1, std::min(char_cell.r_y2, char_cell.r_y3)));
 
-	      char_cell.x1
-		= std::max(char_cell.r_x0, std::max(char_cell.r_x1, std::max(char_cell.r_x2, char_cell.r_x3)));
-	      char_cell.y1
-	      = std::max(char_cell.r_y0, std::max(char_cell.r_y1, std::max(char_cell.r_y2, char_cell.r_y3)));	   
-	      */
+		  char_cell.x1
+		    = std::max(char_cell.r_x0, std::max(char_cell.r_x1, std::max(char_cell.r_x2, char_cell.r_x3)));
+		  char_cell.y1
+		  = std::max(char_cell.r_y0, std::max(char_cell.r_y1, std::max(char_cell.r_y2, char_cell.r_y3)));	   
+		  */
 	      
-	      char_cell.text = item.at("text").get<std::string>();
-	      //char_cell.orig = item.at("text").get<std::string>();
+		  char_cell.text = item.at("text").get<std::string>();
+		  //char_cell.orig = item.at("text").get<std::string>();
 	      
-	      char_cell.rendering_mode = item.at("rendering_mode").get<int>();
+		  char_cell.rendering_mode = item.at("rendering_mode").get<int>();
 
-	      char_cell.font_name = item.at("font_name").get<std::string>();
-	      char_cell.font_key = item.at("font_key").get<std::string>();
+		  char_cell.font_name = item.at("font_name").get<std::string>();
+		  char_cell.font_key = item.at("font_key").get<std::string>();
 
-	      char_cell.left_to_right = item.at("left_to_right").get<bool>();
-	      char_cell.widget = item.at("widget").get<bool>();	      
-	    }
-	    char_cells.push_back(char_cell);	    
+		  char_cell.left_to_right = item.at("left_to_right").get<bool>();
+		  char_cell.widget = item.at("widget").get<bool>();	      
+		}
+		char_cells.push_back(char_cell);	    
+	      }
 	  }
 
 	LOG_S(INFO) << "read " << char_cells.size() << " char-cells";
@@ -160,7 +174,15 @@ namespace docling
       }
     else if(data.is_object())
       {
-	char_cells.init_from(data);	
+	if(data.contains("data"))
+	  {
+	    auto& rows = data.at("data");
+	    char_cells.init_from(rows);
+	  }
+	else
+	  {
+	    char_cells.init_from(data);
+	  }
 	LOG_S(INFO) << "read " << char_cells.size() << " char-cells";
 	
 	return true;
@@ -281,6 +303,38 @@ namespace docling
     return to_records("word");
   }
 
+  nlohmann::json docling_sanitizer::create_word_cells_table(double horizontal_cell_tolerance,
+							    bool enforce_same_font,
+							    double space_width_factor_for_merge)
+  {
+    LOG_S(INFO) << __FUNCTION__;
+
+    word_cells = char_cells;
+
+    auto itr = word_cells.begin();
+    while(itr!=word_cells.end())
+      {
+	if(utils::string::is_space(itr->text))
+	  {
+	    itr = word_cells.erase(itr);
+	  }
+	else
+	  {
+	    itr++;
+	  }
+      }
+
+    double space_width_factor_for_merge_with_space = 2.0*space_width_factor_for_merge;
+
+    cell_sanitizer.sanitize_bbox(word_cells,
+				 horizontal_cell_tolerance,
+				 enforce_same_font,
+				 space_width_factor_for_merge,
+				 space_width_factor_for_merge_with_space);
+
+    return word_cells.get();
+  }
+
   nlohmann::json docling_sanitizer::create_line_cells(double horizontal_cell_tolerance,
 						      bool enforce_same_font,
 						      double space_width_factor_for_merge,
@@ -302,6 +356,24 @@ namespace docling
     LOG_S(INFO) << "initial line-cells: " << line_cells.size();
 
     return to_records("line");
+  }  
+
+  nlohmann::json docling_sanitizer::create_line_cells_table(double horizontal_cell_tolerance,
+							    bool enforce_same_font,
+							    double space_width_factor_for_merge,
+							    double space_width_factor_for_merge_with_space)
+  {
+    LOG_S(INFO) << __FUNCTION__ << " -> char_cells: " << char_cells.size();
+
+    line_cells = char_cells;
+
+    cell_sanitizer.sanitize_bbox(line_cells,
+				 horizontal_cell_tolerance,
+				 enforce_same_font,
+				 space_width_factor_for_merge,
+				 space_width_factor_for_merge_with_space);
+
+    return line_cells.get();
   }  
 
   

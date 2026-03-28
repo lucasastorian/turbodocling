@@ -400,6 +400,29 @@ Sanitize table cells with specified parameters and return the processed JSON.
 
     Returns:
         dict: A JSON object representing the sanitized word cells in the bounding box.)")
+
+    .def("create_word_cells_table",
+	 [](docling::docling_sanitizer &self,
+	    double horizontal_cell_tolerance,
+	    bool enforce_same_font,
+	    double space_width_factor_for_merge = 1.0) -> nlohmann::json {
+	   return self.create_word_cells_table(horizontal_cell_tolerance,
+					       enforce_same_font,
+					       space_width_factor_for_merge);
+	 },
+	 pybind11::arg("horizontal_cell_tolerance")=1.0,
+	 pybind11::arg("enforce_same_font")=true,
+	 pybind11::arg("space_width_factor_for_merge")=0.33,
+	 R"(
+    Create word cells in table form
+
+    Parameters:
+        horizontal_cell_tolerance (float): Vertical adjustment parameter to judge if two cells need to be merged (yes if abs(cell_i.r_y1-cell_i.r_y0)<horizontal_cell_tolerance), default = 1.0.
+        enforce_same_font (bool): Whether to enforce the same font across cells. Default is True
+        space_width_factor_for_merge (float): Factor for merging cells based on space width. Default is 0.33.
+
+    Returns:
+        dict: A table-shaped JSON object with `header` and `data`.)")
     
     .def("create_line_cells",
 	 [](docling::docling_sanitizer &self,
@@ -426,7 +449,34 @@ Sanitize table cells with specified parameters and return the processed JSON.
         space_width_factor_for_merge_with_space (float): Factor for merging cells with space width. Default is 0.33.
 
     Returns:
-        dict: A JSON object representing the sanitized line cells in the bounding box.)");  
+        dict: A JSON object representing the sanitized line cells in the bounding box.)")
+
+    .def("create_line_cells_table",
+	 [](docling::docling_sanitizer &self,
+	    double horizontal_cell_tolerance,
+	    bool enforce_same_font,
+	    double space_width_factor_for_merge = 1.0,
+	    double space_width_factor_for_merge_with_space = 0.33) -> nlohmann::json {
+	   return self.create_line_cells_table(horizontal_cell_tolerance,
+					       enforce_same_font,
+					       space_width_factor_for_merge,
+					       space_width_factor_for_merge_with_space);
+	 },
+	 pybind11::arg("horizontal_cell_tolerance")=1.0,
+	 pybind11::arg("enforce_same_font")=true,
+	 pybind11::arg("space_width_factor_for_merge")=1.0,
+	 pybind11::arg("space_width_factor_for_merge_with_space")=0.33,
+	 R"(
+    Create line cells in table form
+
+    Parameters:
+        horizontal_cell_tolerance (float): Vertical adjustment parameter to judge if two cells need to be merged (yes if abs(cell_i.r_y1-cell_i.r_y0)<horizontal_cell_tolerance), default = 1.0.
+        enforce_same_font (bool): Whether to enforce the same font across cells. Default is True
+        space_width_factor_for_merge (float): Factor for merging cells based on space width. Default is 1.0.
+        space_width_factor_for_merge_with_space (float): Factor for merging cells with space width. Default is 0.33.
+
+    Returns:
+        dict: A table-shaped JSON object with `header` and `data`.)");  
     
     
 }

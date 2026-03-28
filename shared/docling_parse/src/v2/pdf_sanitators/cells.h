@@ -3,6 +3,9 @@
 #ifndef PDF_CELLS_SANITATOR_H
 #define PDF_CELLS_SANITATOR_H
 
+#include <cmath>
+#include <unordered_map>
+
 namespace pdflib
 {
 
@@ -69,48 +72,94 @@ namespace pdflib
 
   void pdf_sanitator<PAGE_CELLS>::remove_duplicate_chars(pdf_resource<PAGE_CELLS>& cells, double eps)
   {
-    while(true)
+    struct duplicate_bucket_key
+    {
+      std::string font_name;
+      std::string text;
+      long long qx0;
+      long long qy0;
+
+      bool operator==(duplicate_bucket_key const& other) const = default;
+    };
+
+    struct duplicate_bucket_hash
+    {
+      std::size_t operator()(duplicate_bucket_key const& key) const
       {
-        bool erased_cell=false;
-        
-        for(int i=0; i<cells.size(); i++)
+        std::size_t seed = std::hash<std::string>{}(key.font_name);
+        seed ^= std::hash<std::string>{}(key.text) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        seed ^= std::hash<long long>{}(key.qx0) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        seed ^= std::hash<long long>{}(key.qy0) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        return seed;
+      }
+    };
+
+    auto quantize = [&](double value) -> long long {
+      return static_cast<long long>(std::floor(value / eps));
+    };
+
+    auto same_cell = [&](pdf_resource<PAGE_CELL>& lhs, pdf_resource<PAGE_CELL>& rhs) -> bool {
+      return lhs.font_name == rhs.font_name &&
+             lhs.text == rhs.text &&
+             utils::values::distance(lhs.r_x0, lhs.r_y0, rhs.r_x0, rhs.r_y0) < eps &&
+             utils::values::distance(lhs.r_x1, lhs.r_y1, rhs.r_x1, rhs.r_y1) < eps &&
+             utils::values::distance(lhs.r_x2, lhs.r_y2, rhs.r_x2, rhs.r_y2) < eps &&
+             utils::values::distance(lhs.r_x3, lhs.r_y3, rhs.r_x3, rhs.r_y3) < eps;
+    };
+
+    std::unordered_map<duplicate_bucket_key, std::vector<int>, duplicate_bucket_hash> buckets;
+    bool erased_cell = false;
+
+    for(int i=0; i<cells.size(); i++)
+      {
+        if(not cells[i].active)
           {
-	    if(not cells[i].active)
-	      {
-		continue;
-	      }
+            continue;
+          }
 
-	    for(int j=i+1; j<cells.size(); j++)
-	      {
-		if(not cells[j].active)
-		  {
-		    continue;
-		  }
+        auto& cell = cells[i];
+        long long const qx0 = quantize(cell.r_x0);
+        long long const qy0 = quantize(cell.r_y0);
 
-		if(cells[i].font_name==cells[j].font_name and
-		   cells[i].text==cells[j].text and
-		   utils::values::distance(cells[i].r_x0, cells[i].r_y0, cells[j].r_x0, cells[j].r_y0)<eps and
-		   utils::values::distance(cells[i].r_x1, cells[i].r_y1, cells[j].r_x1, cells[j].r_y1)<eps and
-		   utils::values::distance(cells[i].r_x2, cells[i].r_y2, cells[j].r_x2, cells[j].r_y2)<eps and
-		   utils::values::distance(cells[i].r_x3, cells[i].r_y3, cells[j].r_x3, cells[j].r_y3)<eps)
-		  {
-		    LOG_S(WARNING) << "removing duplicate char with text: '" << cells[j].text << "' "
-				   << "with r_0: (" << cells[i].r_x0 << ", " << cells[i].r_y0 << ") "
-				   << "with r_2: (" << cells[i].r_x2 << ", " << cells[i].r_y2 << ") "
-				   << "with r'_0: (" << cells[j].r_x0 << ", " << cells[j].r_y0 << ") "
-				   << "with r'_2: (" << cells[j].r_x2 << ", " << cells[j].r_y2 << ") ";
+        bool duplicate = false;
+        for(long long dx = -1; dx <= 1 and not duplicate; dx++)
+          {
+            for(long long dy = -1; dy <= 1 and not duplicate; dy++)
+              {
+                duplicate_bucket_key key{cell.font_name, cell.text, qx0 + dx, qy0 + dy};
+                auto itr = buckets.find(key);
+                if(itr == buckets.end())
+                  {
+                    continue;
+                  }
 
-		    
-		    cells[j].active = false;
-		    erased_cell = true;		    
-		  }		
-	      }
-	  }
-	
-	if(not erased_cell)
-	  {
-	    break;
-	  }
+                for(int prev_index : itr->second)
+                  {
+                    if(not cells[prev_index].active)
+                      {
+                        continue;
+                      }
+
+                    if(same_cell(cells[prev_index], cell))
+                      {
+                        LOG_S(WARNING) << "removing duplicate char with text: '" << cell.text << "' "
+                                       << "with r_0: (" << cells[prev_index].r_x0 << ", " << cells[prev_index].r_y0 << ") "
+                                       << "with r_2: (" << cells[prev_index].r_x2 << ", " << cells[prev_index].r_y2 << ") "
+                                       << "with r'_0: (" << cell.r_x0 << ", " << cell.r_y0 << ") "
+                                       << "with r'_2: (" << cell.r_x2 << ", " << cell.r_y2 << ") ";
+                        cells[i].active = false;
+                        erased_cell = true;
+                        duplicate = true;
+                        break;
+                      }
+                  }
+              }
+          }
+
+        if(not duplicate)
+          {
+            buckets[duplicate_bucket_key{cell.font_name, cell.text, qx0, qy0}].push_back(i);
+          }
       }
 
     pdf_resource<PAGE_CELLS> cells_;
