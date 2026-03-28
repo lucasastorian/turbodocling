@@ -3,8 +3,39 @@
 #ifndef PDF_DOCUMENT_DECODER_H
 #define PDF_DOCUMENT_DECODER_H
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <qpdf/QPDF.hh>
 //#include <qpdf/QPDFPageObjectHelper.hh>
+
+namespace
+{
+  using td_parser_profile_clock = std::chrono::steady_clock;
+
+  inline bool td_parser_profile_enabled()
+  {
+    static bool enabled = []() {
+      if(auto const* env = std::getenv("TD_PARSER_PROFILE"))
+        {
+          return (env[0] != '\0') && !((env[0] == '0') && (env[1] == '\0'));
+        }
+      return false;
+    }();
+
+    return enabled;
+  }
+
+  inline long long td_parser_profile_ns(td_parser_profile_clock::duration duration)
+  {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
+  }
+
+  inline double td_parser_profile_ms(long long ns)
+  {
+    return static_cast<double>(ns) / 1000000.0;
+  }
+}
 
 namespace pdflib
 {
@@ -33,6 +64,10 @@ namespace pdflib
     void decode_document(std::string page_boundary, bool do_sanitization);
 
     void decode_document(std::vector<int>& page_numbers, std::string page_boundary, bool do_sanitization);
+
+    nlohmann::json decode_page_original(int page_number,
+                                        std::string page_boundary,
+                                        bool do_sanitization);
 
   private:
 
@@ -221,6 +256,9 @@ namespace pdflib
   {
     LOG_S(INFO) << "start decoding all pages ...";        
     utils::timer timer;
+    bool const profile_enabled = td_parser_profile_enabled();
+    long long total_page_decode_ns = 0;
+    long long total_page_get_ns = 0;
     
     nlohmann::json& json_pages = json_document["pages"];
     json_pages = nlohmann::json::array({});
@@ -234,16 +272,41 @@ namespace pdflib
 	
         pdf_decoder<PAGE> page_decoder(page);
 
+        auto const decode_start =
+          profile_enabled ? td_parser_profile_clock::now() : td_parser_profile_clock::time_point{};
         auto timings_ = page_decoder.decode_page(page_boundary, do_sanitization);
+        if(profile_enabled)
+          {
+            total_page_decode_ns +=
+              td_parser_profile_ns(td_parser_profile_clock::now() - decode_start);
+          }
 	update_timings(timings_, set_timer);
 	set_timer = false;
 
+        auto const get_start =
+          profile_enabled ? td_parser_profile_clock::now() : td_parser_profile_clock::time_point{};
         json_pages.push_back(page_decoder.get());
+        if(profile_enabled)
+          {
+            total_page_get_ns +=
+              td_parser_profile_ns(td_parser_profile_clock::now() - get_start);
+          }
 
 	std::stringstream ss;
 	ss << "decoding page " << page_number++;
 
 	timings[ss.str()] = page_timer.get_time();
+      }
+
+    if(profile_enabled)
+      {
+        std::fprintf(
+          stderr,
+          "[td-parser] mode=wrapped-all pages=%zu decode_pages=%.3fms page_get=%.3fms total=%.3fms\n",
+          qpdf_document.getAllPages().size(),
+          td_parser_profile_ms(total_page_decode_ns),
+          td_parser_profile_ms(total_page_get_ns),
+          1000.0 * timer.get_time());
       }
 
     timings[__FUNCTION__] = timer.get_time();
@@ -255,6 +318,9 @@ namespace pdflib
   {
     LOG_S(INFO) << "start decoding selected pages ...";        
     utils::timer timer;
+    bool const profile_enabled = td_parser_profile_enabled();
+    long long total_page_decode_ns = 0;
+    long long total_page_get_ns = 0;
 
     // make sure that we only return the page from the page-numbers
     nlohmann::json& json_pages = json_document["pages"];
@@ -273,12 +339,26 @@ namespace pdflib
 	    
 	    pdf_decoder<PAGE> page_decoder(pages.at(page_number));
 	    
+            auto const decode_start =
+              profile_enabled ? td_parser_profile_clock::now() : td_parser_profile_clock::time_point{};
 	    auto timings_ = page_decoder.decode_page(page_boundary, do_sanitization);
+            if(profile_enabled)
+              {
+                total_page_decode_ns +=
+                  td_parser_profile_ns(td_parser_profile_clock::now() - decode_start);
+              }
 	    
 	    update_timings(timings_, set_timer);
 	    set_timer=false;
 	    
+            auto const get_start =
+              profile_enabled ? td_parser_profile_clock::now() : td_parser_profile_clock::time_point{};
 	    json_pages.push_back(page_decoder.get());
+            if(profile_enabled)
+              {
+                total_page_get_ns +=
+                  td_parser_profile_ns(td_parser_profile_clock::now() - get_start);
+              }
 
 	    std::stringstream ss;
 	    ss << "decoding page " << page_number;
@@ -294,7 +374,60 @@ namespace pdflib
 	  }
       }
 
+    if(profile_enabled)
+      {
+        std::fprintf(
+          stderr,
+          "[td-parser] mode=wrapped-selected pages=%zu decode_pages=%.3fms page_get=%.3fms total=%.3fms\n",
+          page_numbers.size(),
+          td_parser_profile_ms(total_page_decode_ns),
+          td_parser_profile_ms(total_page_get_ns),
+          1000.0 * timer.get_time());
+      }
+
     timings[__FUNCTION__] = timer.get_time();
+  }
+
+  nlohmann::json pdf_decoder<DOCUMENT>::decode_page_original(int page_number,
+                                                             std::string page_boundary,
+                                                             bool do_sanitization)
+  {
+    utils::timer timer;
+    bool const profile_enabled = td_parser_profile_enabled();
+
+    std::vector<QPDFObjectHandle> pages = qpdf_document.getAllPages();
+    if(not (0<=page_number and page_number<pages.size()))
+      {
+        LOG_S(WARNING) << "page " << page_number << " is out of bounds ...";
+        return nlohmann::json::value_t::null;
+      }
+
+    pdf_decoder<PAGE> page_decoder(pages.at(page_number));
+
+    auto const decode_start =
+      profile_enabled ? td_parser_profile_clock::now() : td_parser_profile_clock::time_point{};
+    page_decoder.decode_page(page_boundary, do_sanitization);
+    auto const decode_ns =
+      profile_enabled ? td_parser_profile_ns(td_parser_profile_clock::now() - decode_start) : 0;
+
+    auto const get_start =
+      profile_enabled ? td_parser_profile_clock::now() : td_parser_profile_clock::time_point{};
+    auto result = page_decoder.get_original();
+    auto const get_ns =
+      profile_enabled ? td_parser_profile_ns(td_parser_profile_clock::now() - get_start) : 0;
+
+    if(profile_enabled)
+      {
+        std::fprintf(
+          stderr,
+          "[td-parser] mode=original-only page=%d decode_page=%.3fms page_get_original=%.3fms total=%.3fms\n",
+          page_number,
+          td_parser_profile_ms(decode_ns),
+          td_parser_profile_ms(get_ns),
+          1000.0 * timer.get_time());
+      }
+
+    return result;
   }
 
   void pdf_decoder<DOCUMENT>::update_timings(std::map<std::string, double>& timings_,

@@ -220,6 +220,30 @@ PYBIND11_MODULE(pdf_parsers, m) {
     Returns:
         dict: A JSON representation of the parsed page.)")
 
+    .def("parse_pdf_from_key_on_page_original",
+	 [](docling::docling_parser_v2 &self,
+	    const std::string &key,
+	    int page,
+	    const std::string &page_boundary,
+	    bool do_sanitization) -> nlohmann::json {
+	   return self.parse_pdf_from_key_on_page_original(key, page, page_boundary, do_sanitization);
+	 },
+	 pybind11::arg("key"),
+	 pybind11::arg("page"),
+	 pybind11::arg("page_boundary") = "crop_box",
+	 pybind11::arg("do_sanitization") = true,
+	 R"(
+    Parse a specific page and return only the original page payload.
+
+    Parameters:
+        key (str): The unique key of the document.
+        page (int): The page number to parse.
+        page_boundary (str): The page boundary specification for parsing [choices: crop_box, media_box].
+        do_sanitization: Sanitize the chars into lines [default=true].
+
+    Returns:
+        dict: The original page payload without document/page wrapper metadata.)")
+
     .def("sanitize_cells",
 	 [](docling::docling_parser_v2 &self,
 	    nlohmann::json &original_cells,

@@ -55,6 +55,11 @@ namespace docling
 					      std::string page_boundary,
 					      bool do_sanitization);
 
+    nlohmann::json parse_pdf_from_key_on_page_original(std::string key,
+                                                       int page,
+                                                       std::string page_boundary,
+                                                       bool do_sanitization);
+
     nlohmann::json sanitize_cells(nlohmann::json& original_cells,
 				  nlohmann::json& page_dim,
 				  nlohmann::json& page_lines,
@@ -364,7 +369,12 @@ namespace docling
     auto& decoder = itr->second;
     
     std::vector<int> pages = {page};
+    auto const profile_enabled = td_parser_profile_enabled();
+    auto const decode_start =
+      profile_enabled ? td_parser_profile_clock::now() : td_parser_profile_clock::time_point{};
     decoder->decode_document(pages, page_boundary, do_sanitization);
+    auto const decode_ns =
+      profile_enabled ? td_parser_profile_ns(td_parser_profile_clock::now() - decode_start) : 0;
 
     LOG_S(INFO) << "decoding done for for key: " << key << " and page: " << page;
 
@@ -372,8 +382,44 @@ namespace docling
     //auto result = decoder->get();
     //LOG_S(ERROR) << "`" << result.dump(2) << "`";
     //}
-    
-    return decoder->get();
+
+    auto const get_start =
+      profile_enabled ? td_parser_profile_clock::now() : td_parser_profile_clock::time_point{};
+    auto result = decoder->get();
+    auto const get_ns =
+      profile_enabled ? td_parser_profile_ns(td_parser_profile_clock::now() - get_start) : 0;
+
+    if(profile_enabled)
+      {
+        std::fprintf(
+          stderr,
+          "[td-parser] mode=wrapped-return page=%d decode_document=%.3fms document_get=%.3fms total=%.3fms\n",
+          page,
+          td_parser_profile_ms(decode_ns),
+          td_parser_profile_ms(get_ns),
+          td_parser_profile_ms(decode_ns + get_ns));
+      }
+
+    return result;
+  }
+
+  nlohmann::json docling_parser_v2::parse_pdf_from_key_on_page_original(std::string key,
+                                                                        int page,
+                                                                        std::string page_boundary,
+                                                                        bool do_sanitization)
+  {
+    LOG_S(INFO) << __FUNCTION__;
+
+    auto itr = key2doc.find(key);
+    if(itr==key2doc.end())
+      {
+        LOG_S(ERROR) << "key not found: " << key << " " << key2doc.count(key);
+        return nlohmann::json::value_t::null;
+      }
+
+    auto& decoder = itr->second;
+
+    return decoder->decode_page_original(page, page_boundary, do_sanitization);
   }
 
   nlohmann::json docling_parser_v2::sanitize_cells(nlohmann::json& json_cells,

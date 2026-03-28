@@ -20,6 +20,7 @@ namespace pdflib
     ~pdf_decoder();
 
     nlohmann::json get();
+    nlohmann::json get_original();
 
     std::map<std::string, double> decode_page(std::string page_boundary, bool do_sanitization);
 
@@ -89,6 +90,18 @@ namespace pdflib
   pdf_decoder<PAGE>::~pdf_decoder()
   {
   }
+
+  nlohmann::json pdf_decoder<PAGE>::get_original()
+  {
+    nlohmann::json original;
+
+    original["dimension"] = page_dimension.get();
+    original["images"] = page_images.get();
+    original["cells"] = page_cells.get();
+    original["lines"] = page_lines.get();
+
+    return original;
+  }
   
   nlohmann::json pdf_decoder<PAGE>::get()
   {
@@ -107,13 +120,7 @@ namespace pdflib
       {
 	nlohmann::json& original = result["original"];
 
-        original["dimension"] = page_dimension.get();
-
-        original["images"] = page_images.get();
-
-        original["cells"] = page_cells.get();
-        
-        original["lines"] = page_lines.get();
+        original = get_original();
       }
 
       {

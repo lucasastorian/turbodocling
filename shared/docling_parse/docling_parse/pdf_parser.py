@@ -129,22 +129,37 @@ class PdfDocument:
             return self._pages[page_no]
         else:
             if 1 <= page_no <= self.number_of_pages():
-                doc_dict = self._parser.parse_pdf_from_key_on_page(
-                    key=self._key,
-                    page=page_no - 1,
-                    page_boundary=self._boundary_type,
-                    do_sanitization=False,
-                )
-                for pi, page in enumerate(
-                    doc_dict["pages"]
-                ):  # only one page is expected
+                if hasattr(self._parser, "parse_pdf_from_key_on_page_original"):
+                    page_dict = self._parser.parse_pdf_from_key_on_page_original(
+                        key=self._key,
+                        page=page_no - 1,
+                        page_boundary=self._boundary_type,
+                        do_sanitization=False,
+                    )
                     self._pages[page_no] = self._to_segmented_page(
-                        page=page["original"],
+                        page=page_dict,
                         create_words=create_words,
                         create_textlines=create_textlines,
                         enforce_same_font=enforce_same_font,
-                    )  # put on cache
+                    )
                     return self._pages[page_no]
+                else:
+                    doc_dict = self._parser.parse_pdf_from_key_on_page(
+                        key=self._key,
+                        page=page_no - 1,
+                        page_boundary=self._boundary_type,
+                        do_sanitization=False,
+                    )
+                    for pi, page in enumerate(
+                        doc_dict["pages"]
+                    ):  # only one page is expected
+                        self._pages[page_no] = self._to_segmented_page(
+                            page=page["original"],
+                            create_words=create_words,
+                            create_textlines=create_textlines,
+                            enforce_same_font=enforce_same_font,
+                        )  # put on cache
+                        return self._pages[page_no]
 
         raise ValueError(
             f"incorrect page_no: {page_no} for key={self._key} (min:1, max:{self.number_of_pages()})"
