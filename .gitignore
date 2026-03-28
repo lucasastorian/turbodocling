@@ -16,8 +16,6 @@ __pycache__
 shared/docling_parse/build/
 shared/docling_parse/externals/
 shared/docling_parse/test-deploy.zip
-shared/pdf_renderer/target/
-tests/bench_render/target/
 
 # CDK asset staging directory
 .cdk.staging
