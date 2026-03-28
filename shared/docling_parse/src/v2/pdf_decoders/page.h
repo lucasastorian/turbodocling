@@ -346,6 +346,11 @@ namespace pdflib
   {
     LOG_S(INFO) << __FUNCTION__;
     utils::timer timer;
+    bool const profile_enabled = td_stream_profile_enabled();
+    if(profile_enabled)
+      {
+        td_stream_profile_reset();
+      }
 
     QPDFPageObjectHelper          qpdf_page_object(qpdf_page);        
     std::vector<QPDFObjectHandle> contents = qpdf_page_object.getPageContents();
@@ -361,16 +366,35 @@ namespace pdflib
     for(auto content:contents)
       {
         LOG_S(INFO) << "--------------- start decoding content stream (" << (cnt++) << ")... ---------------";        
-        
+        auto const decode_start =
+          profile_enabled ? td_stream_profile_clock::now() : td_stream_profile_clock::time_point{};
         stream_decoder.decode(content);
+        if(profile_enabled)
+          {
+            td_stream_profile().top_level_streams += 1;
+            td_stream_profile().top_level_decode_ns +=
+              td_stream_profile_ns(td_stream_profile_clock::now() - decode_start);
+          }
         //stream_decoder.print();
 
+        auto const interpret_start =
+          profile_enabled ? td_stream_profile_clock::now() : td_stream_profile_clock::time_point{};
         stream_decoder.interprete(parameters);
+        if(profile_enabled)
+          {
+            td_stream_profile().top_level_interpret_ns +=
+              td_stream_profile_ns(td_stream_profile_clock::now() - interpret_start);
+          }
 
         if(parameters.size()>0)
           {
             LOG_S(WARNING) << "stream is ending with non-zero number of parameters";
           }
+      }
+
+    if(profile_enabled)
+      {
+        td_stream_profile_log("decode_contents");
       }
 
     timings[__FUNCTION__] = timer.get_time();

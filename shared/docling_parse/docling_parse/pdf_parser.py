@@ -1,6 +1,7 @@
 """Parser for PDF files"""
 
 import hashlib
+import os
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple, Union
@@ -378,7 +379,8 @@ class PdfDocument:
         t5 = _t.time()
 
         n_chars = len(char_cells)
-        if n_chars > 500 or (t5 - t0) > 0.5:
+        profile_python = os.getenv("TD_PY_PROFILE") == "1"
+        if profile_python and (n_chars > 500 or (t5 - t0) > 0.5):
             print(f"[docling_parse] _to_segmented_page: chars={n_chars} words={len(segmented_page.word_cells)} lines={len(segmented_page.textline_cells)} | "
                   f"to_cells={1000*(t1-t0):.0f}ms seg_init={1000*(t2-t1):.0f}ms char_data={1000*(t3-t2):.0f}ms "
                   f"words={1000*(t4-t3):.0f}ms textlines={1000*(t5-t4):.0f}ms total={1000*(t5-t0):.0f}ms")

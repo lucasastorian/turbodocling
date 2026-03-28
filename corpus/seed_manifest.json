@@ -1,0 +1,158 @@
+{
+  "version": 1,
+  "documents": [
+    {
+      "id": "attention_is_all_you_need",
+      "title": "Attention Is All You Need",
+      "categories": ["academic", "vector-heavy", "form-xobject-heavy"],
+      "origin": {
+        "type": "local_copy",
+        "path": "tests/golden/pdfs/attention.pdf"
+      }
+    },
+    {
+      "id": "alphago_zero",
+      "title": "Mastering the game of Go without human knowledge",
+      "categories": ["academic", "text-heavy"],
+      "origin": {
+        "type": "local_copy",
+        "path": "tests/golden/pdfs/alphago_zero.pdf"
+      }
+    },
+    {
+      "id": "apple_10k",
+      "title": "Apple 10-K",
+      "categories": ["sec-filing", "tables", "text-heavy"],
+      "origin": {
+        "type": "local_copy",
+        "path": "tests/golden/pdfs/apple_10k.pdf"
+      }
+    },
+    {
+      "id": "apple_10q",
+      "title": "Apple 10-Q",
+      "categories": ["sec-filing", "tables", "text-heavy"],
+      "origin": {
+        "type": "local_copy",
+        "path": "tests/golden/pdfs/apple_10q.pdf"
+      }
+    },
+    {
+      "id": "berkshire_letter",
+      "title": "Berkshire Hathaway Annual Letter",
+      "categories": ["letter", "text-heavy"],
+      "origin": {
+        "type": "local_copy",
+        "path": "tests/golden/pdfs/berkshire_letter.pdf"
+      }
+    },
+    {
+      "id": "docling_v2",
+      "title": "Docling V2",
+      "categories": ["technical", "mixed-layout"],
+      "origin": {
+        "type": "local_copy",
+        "path": "tests/golden/pdfs/docling_v2.pdf"
+      }
+    },
+    {
+      "id": "nvidia_investor",
+      "title": "NVIDIA Investor Presentation",
+      "categories": ["slides", "graphics", "mixed-layout"],
+      "origin": {
+        "type": "local_copy",
+        "path": "tests/golden/pdfs/nvidia_investor.pdf"
+      }
+    },
+    {
+      "id": "irs_w9_form",
+      "title": "IRS Form W-9",
+      "categories": ["government", "form", "fillable"],
+      "origin": {
+        "type": "download",
+        "url": "https://www.irs.gov/pub/irs-pdf/fw9.pdf"
+      }
+    },
+    {
+      "id": "irs_1040_instructions",
+      "title": "IRS Instructions for Form 1040",
+      "categories": ["government", "instructions", "text-heavy"],
+      "origin": {
+        "type": "download",
+        "url": "https://www.irs.gov/pub/irs-pdf/i1040gi.pdf"
+      }
+    },
+    {
+      "id": "uscis_i9_form",
+      "title": "USCIS Form I-9",
+      "categories": ["government", "form", "fillable"],
+      "origin": {
+        "type": "download",
+        "url": "https://www.uscis.gov/sites/default/files/document/forms/i-9.pdf"
+      }
+    },
+    {
+      "id": "nist_ai_rmf",
+      "title": "NIST AI Risk Management Framework",
+      "categories": ["government", "report", "tables"],
+      "origin": {
+        "type": "download",
+        "url": "https://nvlpubs.nist.gov/nistpubs/ai/NIST.AI.100-1.pdf"
+      }
+    },
+    {
+      "id": "grand_canyon_trip_planner",
+      "title": "Grand Canyon Trip Planner",
+      "categories": ["brochure", "image-heavy", "map"],
+      "origin": {
+        "type": "download",
+        "url": "https://home.nps.gov/grca/learn/news/upload/trip-planner-grca.pdf"
+      }
+    },
+    {
+      "id": "rico_v_united_states",
+      "title": "Rico v. United States",
+      "categories": ["legal-opinion", "court-opinion", "text-heavy"],
+      "origin": {
+        "type": "download",
+        "url": "https://www.supremecourt.gov/opinions/25pdf/24-1056_qn12.pdf"
+      }
+    },
+    {
+      "id": "jica_environment_guideline_japanese",
+      "title": "JICA Environment and Social Considerations Guideline (Japanese)",
+      "categories": ["government", "multilingual", "cjk", "text-heavy"],
+      "origin": {
+        "type": "download",
+        "url": "https://www.jica.go.jp/about/policy/environment/guideline/jica/__icsFiles/afieldfile/2025/02/20/guideline_jap.pdf"
+      }
+    },
+    {
+      "id": "jica_environment_guideline_chinese",
+      "title": "JICA Environment and Social Considerations Guideline (Chinese)",
+      "categories": ["government", "multilingual", "cjk", "text-heavy"],
+      "origin": {
+        "type": "download",
+        "url": "https://www.jica.go.jp/about/policy/environment/guideline/jica/__icsFiles/afieldfile/2025/02/20/guideline_chn.pdf"
+      }
+    },
+    {
+      "id": "jica_environment_guideline_arabic",
+      "title": "JICA Environment and Social Considerations Guideline (Arabic)",
+      "categories": ["government", "multilingual", "rtl", "text-heavy"],
+      "origin": {
+        "type": "download",
+        "url": "https://www.jica.go.jp/about/policy/environment/guideline/jica/__icsFiles/afieldfile/2025/02/20/guideline_arab.pdf"
+      }
+    },
+    {
+      "id": "faa_phak_chapter_9",
+      "title": "FAA Pilot's Handbook of Aeronautical Knowledge Chapter 9",
+      "categories": ["manual", "technical", "diagrams", "mixed-layout"],
+      "origin": {
+        "type": "download",
+        "url": "https://www.faa.gov/sites/faa.gov/files/11_phak_ch9.pdf"
+      }
+    }
+  ]
+}

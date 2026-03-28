@@ -3,8 +3,108 @@
 #ifndef PDF_STREAM_DECODER_H
 #define PDF_STREAM_DECODER_H
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+
 namespace pdflib
 {
+
+  using td_stream_profile_clock = std::chrono::steady_clock;
+
+  inline bool td_stream_profile_enabled()
+  {
+    static bool enabled = []() {
+      if(auto const* env = std::getenv("TD_STREAM_PROFILE"))
+        {
+          return (env[0] != '\0') && !((env[0] == '0') && (env[1] == '\0'));
+        }
+      return false;
+    }();
+
+    return enabled;
+  }
+
+  inline bool td_stream_force_copy_resources()
+  {
+    static bool enabled = []() {
+      if(auto const* env = std::getenv("TD_STREAM_FORCE_COPY_RESOURCES"))
+        {
+          return (env[0] != '\0') && !((env[0] == '0') && (env[1] == '\0'));
+        }
+      return false;
+    }();
+
+    return enabled;
+  }
+
+  inline long long td_stream_profile_ns(td_stream_profile_clock::duration duration)
+  {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
+  }
+
+  inline double td_stream_profile_ms(long long ns)
+  {
+    return static_cast<double>(ns) / 1000000.0;
+  }
+
+  struct td_stream_profile_data
+  {
+    size_t top_level_streams{0};
+    size_t operator_count{0};
+    size_t path_skip_count{0};
+    size_t do_count{0};
+    size_t do_form_count{0};
+    size_t do_image_count{0};
+    long long top_level_decode_ns{0};
+    long long top_level_interpret_ns{0};
+    long long do_total_ns{0};
+    long long do_copy_resources_ns{0};
+    long long do_parse_stream_ns{0};
+    long long do_update_stack_ns{0};
+    long long do_nested_interpret_ns{0};
+  };
+
+  inline td_stream_profile_data& td_stream_profile()
+  {
+    static thread_local td_stream_profile_data profile;
+    return profile;
+  }
+
+  inline void td_stream_profile_reset()
+  {
+    td_stream_profile() = td_stream_profile_data{};
+  }
+
+  inline void td_stream_profile_log(char const* label)
+  {
+    if(not td_stream_profile_enabled())
+      {
+        return;
+      }
+
+    auto const& profile = td_stream_profile();
+    std::fprintf(
+      stderr,
+      "[td-stream] label=%s top_level_streams=%zu operators=%zu path_skips=%zu "
+      "do=%zu do_forms=%zu do_images=%zu top_decode=%.3fms top_interpret=%.3fms "
+      "do_total=%.3fms do_copy_resources=%.3fms do_parse_stream=%.3fms "
+      "do_update_stack=%.3fms do_nested_interpret=%.3fms\n",
+      label,
+      profile.top_level_streams,
+      profile.operator_count,
+      profile.path_skip_count,
+      profile.do_count,
+      profile.do_form_count,
+      profile.do_image_count,
+      td_stream_profile_ms(profile.top_level_decode_ns),
+      td_stream_profile_ms(profile.top_level_interpret_ns),
+      td_stream_profile_ms(profile.do_total_ns),
+      td_stream_profile_ms(profile.do_copy_resources_ns),
+      td_stream_profile_ms(profile.do_parse_stream_ns),
+      td_stream_profile_ms(profile.do_update_stack_ns),
+      td_stream_profile_ms(profile.do_nested_interpret_ns));
+  }
 
   template<>
   class pdf_decoder<STREAM>
@@ -191,6 +291,7 @@ namespace pdflib
   void pdf_decoder<STREAM>::interprete_stream(std::vector<qpdf_instruction>& parameters)
   {
     LOG_S(INFO) << __FUNCTION__;
+    bool const profile_enabled = td_stream_profile_enabled();
 
     //assert(page_fonts.keys()==cgs().page_fonts.keys());
 
@@ -202,12 +303,20 @@ namespace pdflib
           {
             pdf_operator::operator_name  name = pdf_operator::to_name(inst.val);
             pdf_operator::operator_class clss = pdf_operator::to_class(name);
+            if(profile_enabled)
+              {
+                td_stream_profile().operator_count += 1;
+              }
 
             // Skip path drawing operators — they produce lines/rectangles,
             // not text cells. Safe to skip for text extraction.
             if(clss==pdf_operator::PATH_CONSTRUCTION or
                clss==pdf_operator::PATH_PAINTING)
               {
+                if(profile_enabled)
+                  {
+                    td_stream_profile().path_skip_count += 1;
+                  }
                 parameters.clear();
                 continue;
               }
@@ -403,6 +512,12 @@ namespace pdflib
       case pdf_operator::Do:
         {
           LOG_S(INFO) << "executing " << to_string(name);
+          bool const profile_enabled = td_stream_profile_enabled();
+          auto const do_start = profile_enabled ? td_stream_profile_clock::now() : td_stream_profile_clock::time_point{};
+          if(profile_enabled)
+            {
+              td_stream_profile().do_count += 1;
+            }
 
           std::string xobj_name = parameters[0].to_utf8_string();
 
@@ -419,6 +534,10 @@ namespace pdflib
             case XOBJECT_IMAGE:
               {
                 LOG_S(INFO) << "Do_Image: image with `" << xobj_name << "`";
+                if(profile_enabled)
+                  {
+                    td_stream_profile().do_image_count += 1;
+                  }
                 cgs().Do_image(xobj);
               }
               break;
@@ -426,22 +545,63 @@ namespace pdflib
             case XOBJECT_FORM:
               {
                 LOG_S(INFO) << "Do_Form: XObject with name `" << xobj_name << "`";
+                if(profile_enabled)
+                  {
+                    td_stream_profile().do_form_count += 1;
+                  }
 
-                pdf_resource<PAGE_FONTS>     page_fonts_ = page_fonts;
-                pdf_resource<PAGE_GRPHS>     page_grphs_ = page_grphs;
-                pdf_resource<PAGE_XOBJECTS>  page_xobjects_ = page_xobjects;
+                auto const copy_start =
+                  profile_enabled ? td_stream_profile_clock::now() : td_stream_profile_clock::time_point{};
+                bool const force_copy_resources = td_stream_force_copy_resources();
+                std::pair<nlohmann::json, QPDFObjectHandle> xobj_fonts = xobj.get_fonts();
+                std::pair<nlohmann::json, QPDFObjectHandle> xobj_grphs = xobj.get_grphs();
+                std::pair<nlohmann::json, QPDFObjectHandle> xobj_xobjects = xobj.get_xobjects();
+
+                pdf_resource<PAGE_FONTS>    page_fonts_;
+                pdf_resource<PAGE_GRPHS>    page_grphs_;
+                pdf_resource<PAGE_XOBJECTS> page_xobjects_;
+
+                pdf_resource<PAGE_FONTS>*    nested_page_fonts = &page_fonts;
+                pdf_resource<PAGE_GRPHS>*    nested_page_grphs = &page_grphs;
+                pdf_resource<PAGE_XOBJECTS>* nested_page_xobjects = &page_xobjects;
 
                 // parse the resources of the xobject
                 {
-                  std::pair<nlohmann::json, QPDFObjectHandle> xobj_fonts = xobj.get_fonts();
-                  page_fonts_.set(xobj_fonts.first, xobj_fonts.second);
+                  if(force_copy_resources or not xobj_fonts.first.empty())
+                    {
+                      page_fonts_ = page_fonts;
+                      if(not xobj_fonts.first.empty())
+                        {
+                          page_fonts_.set(xobj_fonts.first, xobj_fonts.second);
+                        }
+                      nested_page_fonts = &page_fonts_;
+                    }
 
-                  std::pair<nlohmann::json, QPDFObjectHandle> xobj_grphs = xobj.get_grphs();
-                  page_grphs_.set(xobj_grphs.first, xobj_grphs.second);
+                  if(force_copy_resources or not xobj_grphs.first.empty())
+                    {
+                      page_grphs_ = page_grphs;
+                      if(not xobj_grphs.first.empty())
+                        {
+                          page_grphs_.set(xobj_grphs.first, xobj_grphs.second);
+                        }
+                      nested_page_grphs = &page_grphs_;
+                    }
 
-                  std::pair<nlohmann::json, QPDFObjectHandle> xobj_xobjects = xobj.get_xobjects();
-                  page_xobjects_.set(xobj_xobjects.first, xobj_xobjects.second);
+                  if(force_copy_resources or not xobj_xobjects.first.empty())
+                    {
+                      page_xobjects_ = page_xobjects;
+                      if(not xobj_xobjects.first.empty())
+                        {
+                          page_xobjects_.set(xobj_xobjects.first, xobj_xobjects.second);
+                        }
+                      nested_page_xobjects = &page_xobjects_;
+                    }
                 }
+                if(profile_enabled)
+                  {
+                    td_stream_profile().do_copy_resources_ns +=
+                      td_stream_profile_ns(td_stream_profile_clock::now() - copy_start);
+                  }
                 
                 {
                   // push-back the stack 
@@ -451,18 +611,39 @@ namespace pdflib
                   cgs().cm(xobj.get_matrix());
 
                   {
+                    auto const parse_stream_start =
+                      profile_enabled ? td_stream_profile_clock::now() : td_stream_profile_clock::time_point{};
                     std::vector<qpdf_instruction> insts = xobj.parse_stream();
+                    if(profile_enabled)
+                      {
+                        td_stream_profile().do_parse_stream_ns +=
+                          td_stream_profile_ns(td_stream_profile_clock::now() - parse_stream_start);
+                      }
 
                     pdf_decoder<STREAM> new_stream(page_dimension, page_cells, 
                                                    page_lines, page_images, 
-                                                   page_fonts_, page_grphs_, 
-						   page_xobjects_);
+                                                   *nested_page_fonts, *nested_page_grphs, 
+						   *nested_page_xobjects);
 
+                    auto const update_stack_start =
+                      profile_enabled ? td_stream_profile_clock::now() : td_stream_profile_clock::time_point{};
                     bool updated_stack = new_stream.update_stack(stack, stack_count);
+                    if(profile_enabled)
+                      {
+                        td_stream_profile().do_update_stack_ns +=
+                          td_stream_profile_ns(td_stream_profile_clock::now() - update_stack_start);
+                      }
 
                     // copy the stack
                     std::vector<qpdf_instruction> parameters;
+                    auto const nested_interpret_start =
+                      profile_enabled ? td_stream_profile_clock::now() : td_stream_profile_clock::time_point{};
                     new_stream.interprete(insts, parameters);
+                    if(profile_enabled)
+                      {
+                        td_stream_profile().do_nested_interpret_ns +=
+                          td_stream_profile_ns(td_stream_profile_clock::now() - nested_interpret_start);
+                      }
 
                     if(updated_stack)
                       {
@@ -488,6 +669,12 @@ namespace pdflib
               {
                 LOG_S(ERROR) << " unknown subtype of xobject with name " << xobj_name;
               }
+            }
+
+          if(profile_enabled)
+            {
+              td_stream_profile().do_total_ns +=
+                td_stream_profile_ns(td_stream_profile_clock::now() - do_start);
             }
         }
         break;
