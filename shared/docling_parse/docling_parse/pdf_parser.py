@@ -237,7 +237,52 @@ class PdfDocument:
             bleed_bbox=bleed_bbox,
         )
 
-    def _to_cells(self, cells: dict) -> List[Union[PdfTextCell, TextCell]]:
+    @staticmethod
+    def _char_cell_payload_from_row(row: list, col: dict[str, int]) -> dict:
+        return {
+            "rect": {
+                "r_x0": row[col["r_x0"]],
+                "r_y0": row[col["r_y0"]],
+                "r_x1": row[col["r_x1"]],
+                "r_y1": row[col["r_y1"]],
+                "r_x2": row[col["r_x2"]],
+                "r_y2": row[col["r_y2"]],
+                "r_x3": row[col["r_x3"]],
+                "r_y3": row[col["r_y3"]],
+            },
+            "text": row[col["text"]],
+            "font_key": row[col["font-key"]],
+            "font_name": row[col["font-name"]],
+            "widget": row[col["widget"]],
+            "left_to_right": row[col["left_to_right"]],
+            "rendering_mode": row[col["rendering-mode"]],
+        }
+
+    @staticmethod
+    def _char_cell_payload_from_cell(item: Union[PdfTextCell, TextCell]) -> dict:
+        rect = item.rect
+        return {
+            "rect": {
+                "r_x0": rect.r_x0,
+                "r_y0": rect.r_y0,
+                "r_x1": rect.r_x1,
+                "r_y1": rect.r_y1,
+                "r_x2": rect.r_x2,
+                "r_y2": rect.r_y2,
+                "r_x3": rect.r_x3,
+                "r_y3": rect.r_y3,
+            },
+            "text": item.text,
+            "font_key": item.font_key,
+            "font_name": item.font_name,
+            "widget": item.widget,
+            "left_to_right": item.text_direction == TextDirection.LEFT_TO_RIGHT,
+            "rendering_mode": item.rendering_mode,
+        }
+
+    def _to_cells(
+        self, cells: dict, *, with_char_data: bool = False
+    ) -> Union[List[Union[PdfTextCell, TextCell]], Tuple[List[Union[PdfTextCell, TextCell]], List[dict]]]:
 
         assert "data" in cells, '"data" in cells'
         assert "header" in cells, '"header" in cells'
@@ -248,6 +293,7 @@ class PdfDocument:
         col = {name: header.index(name) for name in header}
 
         result: List[Union[PdfTextCell, TextCell]] = []
+        char_data = [] if with_char_data else None
         for ind, row in enumerate(data):
             rect = BoundingRectangle(
                 r_x0=row[col["r_x0"]],
@@ -276,6 +322,11 @@ class PdfDocument:
             )
             result.append(cell)
 
+            if char_data is not None:
+                char_data.append(self._char_cell_payload_from_row(row, col))
+
+        if char_data is not None:
+            return result, char_data
         return result
 
     def _to_bitmap_resources(self, images: dict) -> List[BitmapResource]:
@@ -330,15 +381,13 @@ class PdfDocument:
     @staticmethod
     def _build_char_data(char_cells: List[Union[PdfTextCell, TextCell]]) -> List[dict]:
         """Build the sanitizer-compatible dict list from char cells once."""
-        char_data = []
-        for item in char_cells:
-            item_dict = item.model_dump(mode="json", by_alias=True, exclude_none=True)
-            item_dict["left_to_right"] = (
-                item.text_direction == TextDirection.LEFT_TO_RIGHT
-            )
-            item_dict["id"] = item.index
-            char_data.append(item_dict)
-        return char_data
+        return [
+            PdfDocument._char_cell_payload_from_cell(item) for item in char_cells
+        ]
+
+    @staticmethod
+    def _load_text_cells(data: List[dict]) -> List[PdfTextCell]:
+        return [PdfTextCell.model_validate(item) for item in data]
 
     def _to_segmented_page(
         self,
@@ -351,7 +400,12 @@ class PdfDocument:
         import time as _t
 
         t0 = _t.time()
-        char_cells = self._to_cells(page["cells"])
+        needs_char_data = create_words or create_textlines
+        if needs_char_data:
+            char_cells, char_data = self._to_cells(page["cells"], with_char_data=True)
+        else:
+            char_cells = self._to_cells(page["cells"])
+            char_data = None
         t1 = _t.time()
 
         segmented_page = SegmentedPdfPage(
@@ -365,17 +419,32 @@ class PdfDocument:
         )
         t2 = _t.time()
 
-        char_data = self._build_char_data(char_cells) if (create_words or create_textlines) else None
         t3 = _t.time()
 
-        if create_words:
-            self._create_word_cells(segmented_page, char_data=char_data, enforce_same_font=enforce_same_font)
+        sanitizer = None
+        if needs_char_data:
+            sanitizer = pdf_sanitizer(level="fatal")
+            sanitizer.set_char_cells(data=char_data)
+
+        if create_words and sanitizer is not None:
+            segmented_page.word_cells = self._load_text_cells(
+                sanitizer.create_word_cells(
+                    space_width_factor_for_merge=0.33,
+                    enforce_same_font=enforce_same_font,
+                )
+            )
+            segmented_page.has_words = len(segmented_page.word_cells) > 0
         t4 = _t.time()
 
-        if create_textlines:
-            self._create_textline_cells(
-                segmented_page, char_data=char_data, enforce_same_font=enforce_same_font
+        if create_textlines and sanitizer is not None:
+            segmented_page.textline_cells = self._load_text_cells(
+                sanitizer.create_line_cells(
+                    space_width_factor_for_merge=1.0,
+                    space_width_factor_for_merge_with_space=0.33,
+                    enforce_same_font=enforce_same_font,
+                )
             )
+            segmented_page.has_lines = len(segmented_page.textline_cells) > 0
         t5 = _t.time()
 
         n_chars = len(char_cells)
@@ -408,15 +477,12 @@ class PdfDocument:
         sanitizer.set_char_cells(data=char_data)
 
         # data = sanitizer.create_word_cells(space_width_factor_for_merge=0.33)
-        data = sanitizer.create_word_cells(
-            space_width_factor_for_merge=space_width_factor_for_merge,
-            enforce_same_font=enforce_same_font,
+        segmented_page.word_cells = self._load_text_cells(
+            sanitizer.create_word_cells(
+                space_width_factor_for_merge=space_width_factor_for_merge,
+                enforce_same_font=enforce_same_font,
+            )
         )
-
-        segmented_page.word_cells = []
-        for item in data:
-            cell = PdfTextCell.model_validate(item)
-            segmented_page.word_cells.append(cell)
 
         segmented_page.has_words = len(segmented_page.word_cells) > 0
 
@@ -441,16 +507,13 @@ class PdfDocument:
         sanitizer.set_char_cells(data=char_data)
 
         # data = sanitizer.create_line_cells()
-        data = sanitizer.create_line_cells(
-            space_width_factor_for_merge=space_width_factor_for_merge,
-            space_width_factor_for_merge_with_space=space_width_factor_for_merge_with_space,
-            enforce_same_font=enforce_same_font,
+        segmented_page.textline_cells = self._load_text_cells(
+            sanitizer.create_line_cells(
+                space_width_factor_for_merge=space_width_factor_for_merge,
+                space_width_factor_for_merge_with_space=space_width_factor_for_merge_with_space,
+                enforce_same_font=enforce_same_font,
+            )
         )
-
-        segmented_page.textline_cells = []
-        for item in data:
-            cell = PdfTextCell.model_validate(item)
-            segmented_page.textline_cells.append(cell)
 
         segmented_page.has_lines = len(segmented_page.textline_cells) > 0
 
