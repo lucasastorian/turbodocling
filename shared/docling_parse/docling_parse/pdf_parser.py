@@ -10,8 +10,10 @@ from docling_core.types.doc.base import BoundingBox, CoordOrigin
 from docling_core.types.doc.page import (
     BitmapResource,
     BoundingRectangle,
+    ColorRGBA,
     Coord2D,
     ParsedPdfDocument,
+    PdfCellRenderingMode,
     PdfLine,
     PdfMetaData,
     PdfPageBoundaryType,
@@ -22,11 +24,60 @@ from docling_core.types.doc.page import (
     TextCell,
     TextDirection,
 )
+from pydantic import ConfigDict
 
 try:
     from docling_parse.pdf_parsers import pdf_parser_v2, pdf_sanitizer
 except ImportError as e:
     raise ImportError("C++ extension modules not available. Build the package first.") from e
+
+
+_COMPACT_CELL_HEADER = [
+    "r_x0",
+    "r_y0",
+    "r_x1",
+    "r_y1",
+    "r_x2",
+    "r_y2",
+    "r_x3",
+    "r_y3",
+    "text",
+    "rendering-mode",
+    "font-key",
+    "font-name",
+    "widget",
+    "left_to_right",
+]
+_COMPACT_RECT_FIELDS = frozenset(
+    {"r_x0", "r_y0", "r_x1", "r_y1", "r_x2", "r_y2", "r_x3", "r_y3", "coord_origin"}
+)
+_COMPACT_TEXT_CELL_FIELDS = frozenset(
+    {
+        "index",
+        "rgba",
+        "rect",
+        "text",
+        "orig",
+        "text_direction",
+        "confidence",
+        "from_ocr",
+        "rendering_mode",
+        "widget",
+        "font_key",
+        "font_name",
+    }
+)
+_DEFAULT_COORD_ORIGIN = CoordOrigin.BOTTOMLEFT
+_DEFAULT_TEXT_DIRECTION_LTR = TextDirection.LEFT_TO_RIGHT
+_DEFAULT_TEXT_DIRECTION_RTL = TextDirection.RIGHT_TO_LEFT
+_RENDERING_MODE_ENUM_BY_VALUE = {mode.value: mode for mode in PdfCellRenderingMode}
+
+
+class _FrozenDefaultColorRGBA(ColorRGBA):
+    model_config = ConfigDict(frozen=True)
+
+
+_DEFAULT_RGBA_SHARED = _FrozenDefaultColorRGBA(r=0, g=0, b=0, a=255)
 
 
 class PdfDocument:
@@ -318,6 +369,60 @@ class PdfDocument:
 
         data = cells["data"]
         header = cells["header"]
+
+        if not with_char_data and header == _COMPACT_CELL_HEADER:
+            result: List[Union[PdfTextCell, TextCell]] = []
+            append = result.append
+            for ind, row in enumerate(data):
+                rect = object.__new__(BoundingRectangle)
+                rect.__dict__.update(
+                    {
+                        "r_x0": row[0],
+                        "r_y0": row[1],
+                        "r_x1": row[2],
+                        "r_y1": row[3],
+                        "r_x2": row[4],
+                        "r_y2": row[5],
+                        "r_x3": row[6],
+                        "r_y3": row[7],
+                        "coord_origin": _DEFAULT_COORD_ORIGIN,
+                    }
+                )
+                rect.__pydantic_fields_set__ = _COMPACT_RECT_FIELDS
+                rect.__pydantic_extra__ = None
+                rect.__pydantic_private__ = None
+
+                text = row[8]
+                cell = object.__new__(PdfTextCell)
+                cell.__dict__.update(
+                    {
+                        "index": ind,
+                        "rgba": _DEFAULT_RGBA_SHARED,
+                        "rect": rect,
+                        "text": text,
+                        "orig": text,
+                        "text_direction": (
+                            _DEFAULT_TEXT_DIRECTION_LTR
+                            if row[13]
+                            else _DEFAULT_TEXT_DIRECTION_RTL
+                        ),
+                        "confidence": 1.0,
+                        "from_ocr": False,
+                        "rendering_mode": _RENDERING_MODE_ENUM_BY_VALUE.get(
+                            row[9], PdfCellRenderingMode.UNKNOWN
+                        ),
+                        "widget": row[12],
+                        "font_key": row[10],
+                        "font_name": row[11],
+                    }
+                )
+                cell.__pydantic_fields_set__ = _COMPACT_TEXT_CELL_FIELDS
+                cell.__pydantic_extra__ = None
+                cell.__pydantic_private__ = None
+
+                append(cell)
+
+            return result
 
         col = {name: header.index(name) for name in header}
 
