@@ -157,12 +157,13 @@ class MainService:
         while not self.shutdown_event.is_set():
             await asyncio.sleep(60)
             elapsed, pages, docs = self.registry.stats()
+            active_pages = self.registry.active_page_count()
             usage_bytes, limit_bytes, usage_ratio = memory_state()
             mem_str = f"mem={usage_ratio*100:.0f}% ({usage_bytes/(1024**3):.1f}/{limit_bytes/(1024**3):.1f}GiB)" if usage_ratio else "mem=n/a"
             pps = pages / elapsed if elapsed > 0 else 0
             logger.info(
                 f"STATS elapsed={elapsed:.0f}s docs={docs} pages={pages} "
-                f"throughput={pps:.1f}p/s active={self.registry.active_job_count()} "
+                f"throughput={pps:.1f}p/s active={self.registry.active_job_count()} active_pages={active_pages} "
                 f"ql={self.layout_queue.qsize()} {mem_str}"
             )
 

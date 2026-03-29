@@ -82,7 +82,6 @@ class BatchedTableDecoder:
         first_lcel = torch.ones(B, dtype=torch.bool, device=device)
         skip_next = torch.ones(B, dtype=torch.bool, device=device)
         prev_ucel = torch.zeros(B, dtype=torch.bool, device=device)
-        line_num = torch.zeros(B, dtype=torch.long, device=device)
         # bbox_ind removed - using tag_H_counts instead
 
         # GPU-only bbox tracking with preallocated buffers
@@ -157,8 +156,8 @@ class BatchedTableDecoder:
 
             # ---- Structure corrections (all on GPU) ----
             if self.xcel_id is not None and self.lcel_id is not None:
-                mask_first_line = (line_num == 0) & (new_tags == self.xcel_id)
-                new_tags = torch.where(mask_first_line, self.lcel_id.expand(B), new_tags)
+                # Match stock decoder semantics: xcel is always coerced to lcel here.
+                new_tags = torch.where(new_tags == self.xcel_id, self.lcel_id.expand(B), new_tags)
 
             # For ucel->lcel correction, check prev_ucel from PREVIOUS step
             if self.ucel_id is not None and self.lcel_id is not None and self.fcel_id is not None:
@@ -258,10 +257,6 @@ class BatchedTableDecoder:
             # Update prev_ucel for NEXT iteration
             prev_ucel = (new_tags == self.ucel_id) if self.ucel_id is not None else torch.zeros_like(new_tags,
                                                                                                      dtype=torch.bool)
-
-            # Update line number
-            if self.nl_id is not None:
-                line_num += (new_tags == self.nl_id).to(line_num.dtype)
 
         # ---- Check for overflow AFTER loop (single sync, not per-token!) ----
         if __debug__:

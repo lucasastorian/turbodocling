@@ -11,6 +11,7 @@ class JobRegistry:
     def __init__(self):
         self.task_tokens: Dict[str, str] = {}
         self.job_start_times: Dict[str, float] = {}
+        self.job_total_pages: Dict[str, int] = {}
         self.pdf_cache: Dict[str, bytes] = {}
         self.final_docs: Dict[str, Dict[str, Any]] = {}
 
@@ -25,12 +26,17 @@ class JobRegistry:
         active.update(self.final_docs)
         return len(active)
 
-    def register_job(self, job_id: str, token: str):
+    def active_page_count(self) -> int:
+        return sum(self.job_total_pages.values())
+
+    def register_job(self, job_id: str, token: str, total_pages: int):
         self.task_tokens[job_id] = token
         self.job_start_times[job_id] = time.time()
+        self.job_total_pages[job_id] = total_pages
 
     def pop_token(self, job_id: str) -> Optional[str]:
         self.job_start_times.pop(job_id, None)
+        self.job_total_pages.pop(job_id, None)
         return self.task_tokens.pop(job_id, None)
 
     def record_completed(self, pages: int):
@@ -56,3 +62,4 @@ class JobRegistry:
                 pass
         self.task_tokens.clear()
         self.job_start_times.clear()
+        self.job_total_pages.clear()

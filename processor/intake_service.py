@@ -12,7 +12,7 @@ from botocore.exceptions import ClientError
 from processor.shared.logging_config import get_logger
 from processor.shared.config import (
     MAX_SQS_BATCH, LAYOUT_ENQ_BATCH, MAX_LOCAL_PAGES,
-    MAX_INFLIGHT_DOCS, MAX_MEMORY_UTILIZATION,
+    MAX_INFLIGHT_DOCS, MAX_INFLIGHT_PAGES, MAX_MEMORY_UTILIZATION,
 )
 from processor.shared.memory import memory_state
 from processor.shared.telemetry import mark
@@ -46,31 +46,47 @@ class IntakeService:
         self.registry = registry
         self._last_mem_log = 0.0
 
+    def _has_capacity(self) -> bool:
+        try:
+            layout_qsize = self.layout_queue.qsize()
+            active_jobs = self.registry.active_job_count()
+            active_pages = self.registry.active_page_count()
+            usage_bytes, limit_bytes, usage_ratio = memory_state()
+            memory_high = usage_ratio is not None and usage_ratio >= MAX_MEMORY_UTILIZATION
+            docs_high = MAX_INFLIGHT_DOCS > 0 and active_jobs >= MAX_INFLIGHT_DOCS
+            pages_high = active_pages >= MAX_INFLIGHT_PAGES
+
+            if layout_qsize >= MAX_LOCAL_PAGES or docs_high or pages_high or memory_high:
+                if (
+                    (memory_high or pages_high)
+                    and time.monotonic() - self._last_mem_log >= 5.0
+                ):
+                    mem_str = (
+                        f"{usage_ratio * 100.0:.1f}% "
+                        f"({usage_bytes / (1024 ** 3):.1f}/{limit_bytes / (1024 ** 3):.1f} GiB)"
+                        if usage_ratio is not None and usage_bytes is not None and limit_bytes is not None
+                        else "n/a"
+                    )
+                    logger.info(
+                        "intake paused: mem=%s active_jobs=%d active_pages=%d ql=%d",
+                        mem_str,
+                        active_jobs,
+                        active_pages,
+                        layout_qsize,
+                    )
+                    self._last_mem_log = time.monotonic()
+                return False
+        except Exception:
+            pass
+        return True
+
     async def run(self):
         while not self.shutdown_event.is_set():
-            try:
-                layout_qsize = self.layout_queue.qsize()
-                active_jobs = self.registry.active_job_count()
-                usage_bytes, limit_bytes, usage_ratio = memory_state()
-                memory_high = usage_ratio is not None and usage_ratio >= MAX_MEMORY_UTILIZATION
+            if not self._has_capacity():
+                await asyncio.sleep(0.1)
+                continue
 
-                if layout_qsize >= MAX_LOCAL_PAGES or active_jobs >= MAX_INFLIGHT_DOCS or memory_high:
-                    if memory_high and time.monotonic() - self._last_mem_log >= 5.0:
-                        logger.info(
-                            "intake paused: memory %.1f%% (%0.1f/%0.1f GiB) active_jobs=%d ql=%d",
-                            usage_ratio * 100.0,
-                            usage_bytes / (1024 ** 3),
-                            limit_bytes / (1024 ** 3),
-                            active_jobs,
-                            layout_qsize,
-                        )
-                        self._last_mem_log = time.monotonic()
-                    await asyncio.sleep(0.1)
-                    continue
-            except Exception:
-                pass
-
-            fetch_limit = min(MAX_SQS_BATCH, max(1, MAX_INFLIGHT_DOCS - self.registry.active_job_count()))
+            fetch_limit = MAX_SQS_BATCH
             msgs = await asyncio.to_thread(self._poll_sqs, fetch_limit)
             if not msgs:
                 await asyncio.sleep(0.2)
@@ -78,9 +94,15 @@ class IntakeService:
 
             logger.info(f"sqs: {len(msgs)}")
             for m in msgs:
+                if not self._has_capacity():
+                    self._release_message(m['receipt_handle'])
+                    continue
                 try:
                     await self._handle_message(m)
                 except Exception as e:
+                    self.registry.pop_token(m.get('job_id', ''))
+                    self.registry.pdf_cache.pop(m.get('job_id', ''), None)
+                    self.registry.final_docs.pop(m.get('job_id', ''), None)
                     logger.exception(f"handle_message failed: {e}")
 
     def _poll_sqs(self, n: int) -> List[Dict]:
@@ -116,7 +138,7 @@ class IntakeService:
 
         task_token = message.get('task_token')
         if task_token:
-            self.registry.register_job(job_id, task_token)
+            self.registry.register_job(job_id, task_token, total_pages)
 
         download_start = time.time()
         pdf_key = f"uploads/{user_id}/{job_id}/source.pdf"
@@ -210,3 +232,13 @@ class IntakeService:
             self.sqs_client.delete_message(QueueUrl=self.queue_url, ReceiptHandle=receipt_handle)
         except ClientError as e:
             logger.warning(f"SQS delete failed: {e}")
+
+    def _release_message(self, receipt_handle: str):
+        try:
+            self.sqs_client.change_message_visibility(
+                QueueUrl=self.queue_url,
+                ReceiptHandle=receipt_handle,
+                VisibilityTimeout=0,
+            )
+        except ClientError as e:
+            logger.warning(f"SQS visibility reset failed: {e}")
