@@ -44,3 +44,5 @@ corpus/pdfs/
 corpus/baselines/
 corpus/benchmarks/
 corpus/manifest.lock.json
+
+docs/table-merge-bug.md

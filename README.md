@@ -22,7 +22,7 @@ Or you need to backfill a million pages and don't want to pay $0.015/page for AW
 
 Turbodocling is Docling, re-architected for AWS. `cdk deploy` and you're running in minutes. Process a document by calling a Step Function. Scale up for a batch job, scale back down when you're done.
 
-- **Fast.** 12 seconds for an 80-page 10-K. 3 seconds for a short document.
+- **Fast.** 10 seconds for a 93-page 10-K. 2.5 seconds for a short document.
 - **Cheap at scale.** Orders of magnitude less than Textract ($0.015/page) or Mistral OCR ($0.01/page). GPU processes 20+ pages/second and can be shared across concurrent jobs.
 - **Easy to deploy.** One `cdk deploy`. Lambda, SQS, Step Functions, ECS.
 - **Easy to integrate.** Just invoke a Step Function from your existing services.
@@ -30,9 +30,19 @@ Turbodocling is Docling, re-architected for AWS. `cdk deploy` and you're running
 
 | Document | Pages | Turbodocling | Stock Docling | Speedup |
 |---|---|---|---|---|
-| Docling paper | 8 | **3.5s** | 8.0s | 2.3x |
-| Apple 10-Q (Q3 2025) | 29 | **5.7s** | 28.0s | 4.9x |
-| Apple 10-K (FY2025) | 80 | **12.4s** | 66.6s | **5.4x** |
+| Docling paper | 8 | **2.5s** | 8.1s | 3.2x |
+| Attention paper | 15 | **4.6s** | 12.6s | 2.7x |
+| NVIDIA 10-Q (Q3 FY2026) | 48 | **6.0s** | 40.7s | **6.8x** |
+| NVIDIA 10-K (FY2026) | 93 | **9.5s** | 71.0s | **7.5x** |
+
+### Throughput (20x NVIDIA 10-K concurrent, 1860 pages)
+
+| Metric | Stock Docling | Turbodocling |
+|---|---|---|
+| Total wall time | ~1420s (serial) | **111.6s** |
+| Throughput | 1.3 pages/sec | **16.7 pages/sec** |
+| Concurrent docs | 1 (single-threaded) | 4+ (multi-threaded pipeline) |
+| Peak memory | N/A | 49% (13.7/28.0 GiB) |
 
 ---
 
@@ -59,6 +69,23 @@ pip install -e shared/docling_parse
 # Deploy to AWS
 cdk deploy
 ```
+
+### Experimental PDFium Variant
+
+The default Lambda image installs upstream `pypdfium2==5.6.0`. You can opt into the patched PDFium build at deploy time by passing CDK context for the Lambda Docker build:
+
+```bash
+cdk deploy \
+  -c pdfium_variant=experimental \
+  -c pypdfium2_wheel_url=https://github.com/lucasastorian/pdfium/releases/download/YOUR_TAG/pypdfium2-EXPERIMENTAL.whl
+```
+
+Notes:
+
+- `pdfium_variant=upstream` remains the default.
+- `pypdfium2_wheel_url` is required only for `experimental`.
+- This keeps the Python code path unchanged and swaps only the bundled PDFium binary in the Lambda image.
+- Source for the experimental renderer lives in [`lucasastorian/pdfium`](https://github.com/lucasastorian/pdfium) on the `codex-clip-mask-experiment` branch.
 
 ### Process a PDF
 
@@ -215,6 +242,25 @@ The GPU worker is internally multi-threaded: dedicated threads for inference, la
 **GPU Worker (A10G, ECS):** Polls SQS, downloads batches, runs layout + table inference, assembles structured output (markdown + elements JSON).
 
 **Batch sizing:** `ceil(total_pages / 40)` pages per Lambda, so an 80-page doc fans out across 40 parallel invocations.
+
+### GPU Memory and Concurrency
+
+The GPU worker holds entire documents in memory during processing — page images, cell stores, and the source PDF. A 93-page 10-K uses ~2.5 GB resident. The default configuration (g5.2xlarge, 28 GB task memory) comfortably handles 4 concurrent large documents at ~50% memory utilization.
+
+Memory-based backpressure automatically throttles intake when utilization exceeds 50%, so the worker never OOMs — it just queues. For very large documents (400+ pages) or high-concurrency batch workloads, consider upgrading to a larger instance (g5.4xlarge/g5.8xlarge) for more system RAM. The GPU (A10G, 24 GB VRAM) is the same across all g5 sizes.
+
+### Cost
+
+At 16.7 pages/second sustained throughput, processing costs break down to:
+
+| Component | Cost per 10K pages |
+|---|---|
+| Lambda (ARM64, ~2s/batch) | ~$0.06 |
+| Step Functions | ~$0.015 |
+| GPU (A10G, g5.2xlarge @ $1.21/hr) | ~$0.20 |
+| **Total** | **~$0.28** |
+
+For comparison: AWS Textract costs $15 per 10K pages. Mistral OCR costs $10 per 10K pages. Turbodocling is **50-60x cheaper** at scale.
 
 ---
 

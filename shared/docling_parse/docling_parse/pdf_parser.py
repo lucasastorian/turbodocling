@@ -48,10 +48,10 @@ _COMPACT_CELL_HEADER = [
     "widget",
     "left_to_right",
 ]
-_COMPACT_RECT_FIELDS = frozenset(
+_COMPACT_RECT_FIELDS = (
     {"r_x0", "r_y0", "r_x1", "r_y1", "r_x2", "r_y2", "r_x3", "r_y3", "coord_origin"}
 )
-_COMPACT_TEXT_CELL_FIELDS = frozenset(
+_COMPACT_TEXT_CELL_FIELDS = (
     {
         "index",
         "rgba",
@@ -388,7 +388,7 @@ class PdfDocument:
                         "coord_origin": _DEFAULT_COORD_ORIGIN,
                     }
                 )
-                rect.__pydantic_fields_set__ = _COMPACT_RECT_FIELDS
+                rect.__pydantic_fields_set__ = set(_COMPACT_RECT_FIELDS)
                 rect.__pydantic_extra__ = None
                 rect.__pydantic_private__ = None
 
@@ -416,7 +416,7 @@ class PdfDocument:
                         "font_name": row[11],
                     }
                 )
-                cell.__pydantic_fields_set__ = _COMPACT_TEXT_CELL_FIELDS
+                cell.__pydantic_fields_set__ = set(_COMPACT_TEXT_CELL_FIELDS)
                 cell.__pydantic_extra__ = None
                 cell.__pydantic_private__ = None
 

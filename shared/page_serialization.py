@@ -6,13 +6,10 @@ to pack parsed PDF pages into a compact binary format for the GPU processor.
 """
 
 import array
-from typing import List, Dict, Any
-
-from docling_core.types.doc.page import SegmentedPdfPage
-from docling_core.types.doc import TextDirection
+from typing import Any, Dict, List
 
 
-def pack_segmented_page(seg: SegmentedPdfPage) -> Dict[str, Any]:
+def pack_segmented_page(seg: Any) -> Dict[str, Any]:
     is_topleft = True
     return {
         "version": 2,
@@ -103,7 +100,7 @@ def _pack_cells_columnar(cells: List, is_topleft: bool) -> Dict[str, Any]:
             widget.append(1 if getattr(c, 'widget', False) else 0)
             font_key_idx.append(intern(getattr(c, 'font_key', '')))
             font_name_idx.append(intern(getattr(c, 'font_name', '')))
-            td = getattr(c, 'text_direction', TextDirection.LEFT_TO_RIGHT)
+            td = getattr(c, 'text_direction', 'left_to_right')
             text_dir.append(0 if str(td) == 'left_to_right' else 1)
 
     result = {

@@ -1,5 +1,9 @@
 FROM public.ecr.aws/lambda/python:3.13
 
+ARG PDFIUM_VARIANT=upstream
+ARG PYPDFIUM2_WHEEL_URL=
+ARG PYPDFIUM2_SPEC=pypdfium2==5.6.0
+
 # Install system dependencies for building
 RUN microdnf update -y && microdnf install -y \
     gcc-c++ \
@@ -12,6 +16,20 @@ RUN microdnf update -y && microdnf install -y \
 # Copy Python dependencies
 COPY requirements.txt ${LAMBDA_TASK_ROOT}/
 RUN python3.13 -m pip install --no-cache-dir -r requirements.txt
+RUN set -eux; \
+    case "$PDFIUM_VARIANT" in \
+      upstream) \
+        python3.13 -m pip install --no-cache-dir "$PYPDFIUM2_SPEC" \
+        ;; \
+      experimental) \
+        test -n "$PYPDFIUM2_WHEEL_URL"; \
+        python3.13 -m pip install --no-cache-dir "$PYPDFIUM2_WHEEL_URL" \
+        ;; \
+      *) \
+        echo "Unsupported PDFIUM_VARIANT: $PDFIUM_VARIANT" >&2; \
+        exit 1 \
+        ;; \
+    esac
 
 # Copy our custom libraries (nested structure)
 COPY ../../shared/docling_core/docling_core/ ${LAMBDA_TASK_ROOT}/docling_core/

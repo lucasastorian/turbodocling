@@ -1,5 +1,9 @@
 FROM public.ecr.aws/lambda/python:3.13 AS builder
 
+ARG PDFIUM_VARIANT=upstream
+ARG PYPDFIUM2_WHEEL_URL=
+ARG PYPDFIUM2_SPEC=pypdfium2==5.6.0
+
 # Install build dependencies
 RUN microdnf update -y && microdnf install -y \
     gcc-c++ cmake make zlib-devel git && microdnf clean all
@@ -14,8 +18,24 @@ RUN python3.13 -m pip install --upgrade pip && \
     python3.13 -m pip install --no-cache-dir \
       "pybind11>=2.13.6" "cmake>=3.27.0" "setuptools>=77.0.3" "wheel>=0.43.0" "build>=1.2.1"
 
-# Install runtime dependencies
+# Install runtime dependencies excluding pypdfium2, which is selected below.
 RUN python3.13 -m pip install --no-cache-dir -t /tmp/site -r requirements.txt
+
+# Install the selected pypdfium2 variant.
+RUN set -eux; \
+    case "$PDFIUM_VARIANT" in \
+      upstream) \
+        python3.13 -m pip install --no-cache-dir -t /tmp/site "$PYPDFIUM2_SPEC" \
+        ;; \
+      experimental) \
+        test -n "$PYPDFIUM2_WHEEL_URL"; \
+        python3.13 -m pip install --no-cache-dir -t /tmp/site "$PYPDFIUM2_WHEEL_URL" \
+        ;; \
+      *) \
+        echo "Unsupported PDFIUM_VARIANT: $PDFIUM_VARIANT" >&2; \
+        exit 1 \
+        ;; \
+    esac
 
 # Copy ONLY docling_parse first (for better caching of C++ build)
 COPY shared/docling_parse /docling_parse
@@ -34,10 +54,14 @@ COPY shared/docling_core/docling_core /docling_core
 # Install docling_core (pure Python - just copy the files)
 RUN cp -r /docling_core /tmp/site/
 
-# Copy page_serialization module
-COPY shared/page_serialization.py /tmp/site/shared/__init__.py
-RUN touch /tmp/site/shared/__init__.py
+# Copy shared serialization module
+RUN mkdir -p /tmp/site/shared
+COPY shared/__init__.py /tmp/site/shared/__init__.py
 COPY shared/page_serialization.py /tmp/site/shared/page_serialization.py
+
+# Strip caches from copied Python sources before producing the Lambda asset.
+RUN find /tmp/site -name "*.pyc" -delete && \
+    find /tmp/site -name "__pycache__" -type d -exec rm -rf {} +
 
 # Final stage - output for CDK
 FROM alpine:latest AS output

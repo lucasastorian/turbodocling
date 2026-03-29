@@ -1,14 +1,25 @@
-import os, io, time, boto3, gzip
+import gzip
+import io
+import os
+import time
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+import boto3
 import msgpack
-from typing import List, Optional, Dict, Any
 from PIL import Image
 import pypdfium2 as pdfium
 from pypdfium2 import PdfPage
-from docling_parse.pdf_parser import DoclingPdfParser, PdfDocument
-from docling_core.types.doc.page import SegmentedPdfPage
-from docling_core.types.doc import BoundingBox, Size, CoordOrigin
+from docling_core.types.doc.base import BoundingBox, CoordOrigin, Size
+from docling_parse.pdf_parser import DoclingPdfParser
 
 from shared.page_serialization import pack_segmented_page
+
+if TYPE_CHECKING:
+    from docling_parse.pdf_parser import PdfDocument
+
+
+_S3_CLIENT = boto3.client("s3")
+_DOCLING_PARSER = DoclingPdfParser(loglevel="fatal")
 
 
 class PreprocessingPipeline:
@@ -17,10 +28,8 @@ class PreprocessingPipeline:
 
     def __init__(self, user_id: str):
         self.user_id = user_id
-        self.stage = os.environ.get('STAGE', 'dev')
         self.bucket = os.environ["DOCUMENTS_BUCKET"]
-
-        self.s3_client = boto3.client("s3")
+        self.s3_client = _S3_CLIENT
 
     def process_batch(self, job_id: str, start_page: int, end_page: int, total_pages: int):
         """Processes a batch of pages"""
@@ -28,34 +37,60 @@ class PreprocessingPipeline:
         file_bytes = self._load_from_s3(job_id=job_id)
         t_s3 = time.time()
 
-        pdoc = pdfium.PdfDocument(io.BytesIO(file_bytes))
-        t_pdfium = time.time()
-        parser = DoclingPdfParser(loglevel="fatal")
-        t_parser_init = time.time()
-        dp_doc: PdfDocument = parser.load(path_or_stream=io.BytesIO(file_bytes))
-        t_load = time.time()
+        pdoc = None
+        dp_doc = None
         job_short = job_id[:8]
-        print(f"[{job_short}] LOAD pdfium={t_pdfium-t_s3:.3f}s parser_init={t_parser_init-t_pdfium:.3f}s "
-              f"docling_load={t_load-t_parser_init:.3f}s pdf_size={len(file_bytes)/1024:.0f}KB")
 
-        pages = self._preprocess_page_batch(pdoc=pdoc, dp_doc=dp_doc, start_page=start_page, end_page=end_page, job_short=job_short)
-        t_preprocess = time.time()
+        try:
+            pdoc = pdfium.PdfDocument(io.BytesIO(file_bytes))
+            t_pdfium = time.time()
 
-        batch_s3_key = self._upload_pages_to_s3(job_id, pages, start_page, end_page)
-        t_upload = time.time()
+            dp_doc = _DOCLING_PARSER.load(path_or_stream=io.BytesIO(file_bytes))
+            t_load = time.time()
+            print(
+                f"[{job_short}] LOAD pdfium={t_pdfium-t_s3:.3f}s "
+                f"docling_load={t_load-t_pdfium:.3f}s pdf_size={len(file_bytes)/1024:.0f}KB"
+            )
 
-        print(f"[{job_short}] TIMING s3_get={t_s3-t0:.3f}s pdf_load={t_load-t_s3:.3f}s "
-              f"preprocess={t_preprocess-t_load:.3f}s s3_put={t_upload-t_preprocess:.3f}s "
-              f"total={t_upload-t0:.3f}s pages={start_page}-{end_page}")
+            pages = self._preprocess_page_batch(
+                pdoc=pdoc,
+                dp_doc=dp_doc,
+                start_page=start_page,
+                end_page=end_page,
+                job_short=job_short,
+            )
+            t_preprocess = time.time()
 
-        return {
-            "batch_key": batch_s3_key,
-            "start_page": start_page,
-            "end_page": end_page
-        }
+            batch_s3_key = self._upload_pages_to_s3(job_id, pages, start_page, end_page)
+            t_upload = time.time()
 
-    def _preprocess_page_batch(self, pdoc: pdfium.PdfDocument, dp_doc: PdfDocument, start_page: int, end_page: int, job_short: str = "") -> \
-    List[Dict[str, Any]]:
+            print(
+                f"[{job_short}] TIMING s3_get={t_s3-t0:.3f}s pdf_load={t_load-t_s3:.3f}s "
+                f"preprocess={t_preprocess-t_load:.3f}s s3_put={t_upload-t_preprocess:.3f}s "
+                f"total={t_upload-t0:.3f}s pages={start_page}-{end_page}"
+            )
+
+            return {
+                "batch_key": batch_s3_key,
+                "start_page": start_page,
+                "end_page": end_page,
+            }
+        finally:
+            if dp_doc is not None:
+                dp_doc.unload()
+            if pdoc is not None:
+                close = getattr(pdoc, "close", None)
+                if callable(close):
+                    close()
+
+    def _preprocess_page_batch(
+        self,
+        pdoc: pdfium.PdfDocument,
+        dp_doc: "PdfDocument",
+        start_page: int,
+        end_page: int,
+        job_short: str = "",
+    ) -> List[Dict[str, Any]]:
         """Segment a page range, calculate the size, and generate images"""
         out: List[Dict[str, Any]] = []
 
@@ -100,7 +135,7 @@ class PreprocessingPipeline:
         return out
 
     @staticmethod
-    def _parse_page(doc: PdfDocument, page_no: int) -> SegmentedPdfPage:
+    def _parse_page(doc: "PdfDocument", page_no: int) -> Any:
         """Parses the page and returns a segmented PDF page"""
         t0 = time.time()
         seg = doc.get_page(page_no + 1, create_words=True, create_textlines=True)

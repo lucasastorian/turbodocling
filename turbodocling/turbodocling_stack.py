@@ -19,10 +19,29 @@ from constructs import Construct
 
 class TurboStack(Stack):
 
-    def __init__(self, scope: Construct, construct_id: str, stage: str = "dev", **kwargs) -> None:
+    def __init__(
+        self,
+        scope: Construct,
+        construct_id: str,
+        stage: str = "dev",
+        pdfium_variant: str = "upstream",
+        pypdfium2_wheel_url: str = "",
+        **kwargs,
+    ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
         self.stage = stage
+        self.pdfium_variant = pdfium_variant.lower()
+        self.pypdfium2_wheel_url = pypdfium2_wheel_url
+
+        if self.pdfium_variant not in {"upstream", "experimental"}:
+            raise ValueError(
+                f"Unsupported pdfium_variant={self.pdfium_variant!r}; expected 'upstream' or 'experimental'."
+            )
+        if self.pdfium_variant == "experimental" and not self.pypdfium2_wheel_url:
+            raise ValueError(
+                "pypdfium2_wheel_url is required when pdfium_variant='experimental'."
+            )
 
         # S3 bucket for documents (input PDFs, intermediate batches, output markdown/JSON)
         documents_bucket = s3.Bucket(
@@ -40,13 +59,18 @@ class TurboStack(Stack):
         # SQS queue for GPU processing jobs
         gpu_queue = sqs.Queue(
             self, "GpuProcessingQueue",
-            visibility_timeout=Duration.seconds(900),
+            visibility_timeout=Duration.seconds(3600),
             retention_period=Duration.days(1),
             dead_letter_queue=sqs.DeadLetterQueue(
                 max_receive_count=3,
                 queue=gpu_dlq,
             ),
         )
+
+        docker_build_args = {
+            "PDFIUM_VARIANT": self.pdfium_variant,
+            "PYPDFIUM2_WHEEL_URL": self.pypdfium2_wheel_url,
+        }
 
         # Lambda: PDF page preprocessing (SnapStart, ARM64)
         pdf_processor = _lambda.Function(
@@ -59,11 +83,13 @@ class TurboStack(Stack):
             environment={
                 "STAGE": self.stage,
                 "DOCUMENTS_BUCKET": documents_bucket.bucket_name,
+                "PDFIUM_VARIANT": self.pdfium_variant,
             },
             code=_lambda.Code.from_docker_build(
                 ".",
                 file="lambdas/process_page_batch/Dockerfile.lambda",
                 platform="linux/arm64",
+                build_args=docker_build_args,
             ),
             snap_start=_lambda.SnapStartConf.ON_PUBLISHED_VERSIONS,
             log_retention=logs.RetentionDays.ONE_WEEK,
@@ -154,7 +180,7 @@ class TurboStack(Stack):
                 "total_pages.$": "$.total_pages",
                 "parts.$": "$.parts",
             }),
-            heartbeat=Duration.seconds(600),
+            heartbeat=Duration.seconds(3600),
         )
 
         success = sfn.Succeed(self, "ProcessingComplete")
@@ -165,7 +191,7 @@ class TurboStack(Stack):
         state_machine = sfn.StateMachine(
             self, "PdfProcessingStateMachine",
             definition_body=sfn.DefinitionBody.from_chainable(definition),
-            timeout=Duration.minutes(30),
+            timeout=Duration.hours(2),
         )
 
         pdf_processor.grant_invoke(state_machine.role)
@@ -211,13 +237,14 @@ class TurboStack(Stack):
         gpu_asg = autoscaling.AutoScalingGroup(
             self, "GpuAsg",
             vpc=vpc,
-            instance_type=ec2.InstanceType("g5.xlarge"),
+            instance_type=ec2.InstanceType("g5.2xlarge"),
             machine_image=ecs.EcsOptimizedImage.amazon_linux2023(
                 hardware_type=ecs.AmiHardwareType.GPU,
             ),
             min_capacity=1,
             max_capacity=1,
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
+            update_policy=autoscaling.UpdatePolicy.replacing_update(),
         )
 
         capacity_provider = ecs.AsgCapacityProvider(
@@ -241,7 +268,7 @@ class TurboStack(Stack):
                 file="processor/Dockerfile",
             ),
             gpu_count=1,
-            memory_limit_mib=14336,
+            memory_limit_mib=28672,
             cpu=4096,
             environment={
                 "DOCUMENTS_BUCKET": documents_bucket.bucket_name,
