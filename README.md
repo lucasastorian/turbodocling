@@ -120,6 +120,45 @@ sfn.start_execution(
 #   processed/user/{job_id}/elements.json   — elements with bboxes per page
 ```
 
+### Working with Elements
+
+Each job produces two outputs. `output.md` is a flat Markdown rendering useful for quick inspection, but it doesn't include images, bounding boxes, or page boundaries. For production use, `elements.json` is the primary output — the document organized into **pages**, each containing **elements** in reading order:
+
+```
+elements.json
+└── pages[]
+    ├── page_no, width, height
+    └── elements[]
+        ├── type          — text, section_header, table, picture, list_item, ...
+        ├── content       — the extracted text or markdown
+        ├── bbox          — { l, t, r, b } in PDF points (provenance)
+        ├── image_base64  — PNG crop for pictures (feed directly to multimodal LLMs)
+        └── level         — heading depth for section_header elements
+```
+
+Every element traces back to a specific region on a specific page. Pictures include base64-encoded image crops ready to embed in multimodal LLM prompts. This makes it straightforward to:
+
+- **Chunk by page** for RAG — each page's elements are self-contained
+- **Feed to multimodal LLMs** — text, tables, and images with spatial context
+- **Track provenance** — every chunk has a page number and bounding box
+- **Build custom views** — filter by element type, skip headers/footers, reconstruct layout
+
+```python
+import boto3, json
+
+s3 = boto3.client("s3")
+data = json.loads(s3.get_object(Bucket=BUCKET, Key=f"processed/user/{job_id}/elements.json")["Body"].read())
+
+for page in data["pages"]:
+    for el in page["elements"]:
+        if el["type"] == "picture" and el.get("image_base64"):
+            # Ready for a multimodal LLM — page number + image + surrounding text
+            pass
+        if el["type"] == "table":
+            # Structured markdown table with provenance
+            pass
+```
+
 ---
 
 ## How Docling Works (and Why It's Slow)
@@ -262,6 +301,14 @@ At 16.7 pages/second sustained throughput, processing costs break down to:
 | **Total** | **~$0.28** |
 
 For comparison: AWS Textract costs $15 per 10K pages. Mistral OCR costs $10 per 10K pages. Turbodocling is **50-60x cheaper** at scale.
+
+---
+
+## Limitations
+
+- **No OCR.** Stock Docling includes OCR support for scanned documents. We haven't added it yet — Turbodocling extracts text from the PDF's native text layer only. Scanned documents or image-only PDFs will produce no text output.
+- **No equation support.** Stock Docling includes an equation parsing model that converts formulas to LaTeX. We haven't added it yet — equations are extracted as images only (base64 crops in `elements.json`).
+- **Table structure is model-dependent.** The TableFormer model occasionally drops rows or misaligns columns on unusual table layouts (signatures, exhibits, multi-level headers). We include a reconciliation step that recovers unmatched tokens as fallback rows, but the underlying model has limits. We recommend verifying table output on your specific document types.
 
 ---
 
