@@ -1,13 +1,27 @@
-import logging
 from typing import Any, Dict, List
 
-from docling_core.types.doc import BoundingBox, DocItemLabel, TableCell
-from docling_core.types.doc.page import TextCellUnit
+from docling_core.types.doc import BoundingBox, CoordOrigin, DocItemLabel, TableCell, TextDirection
+from docling_core.types.doc.page import (
+    BoundingRectangle,
+    ColorRGBA,
+    PdfCellRenderingMode,
+    PdfTextCell,
+    TextCell,
+    TextCellUnit,
+)
 from docling.datamodel.base_models import Table, TableStructurePrediction, Page
 
-logger = logging.getLogger(__name__)
-
 from .table_preprocessor import TablePreprocessor
+
+_CELL_CLASSES = (
+    TextCell,
+    PdfTextCell,
+    BoundingRectangle,
+    CoordOrigin,
+    TextDirection,
+    ColorRGBA,
+    PdfCellRenderingMode,
+)
 
 
 class TableStructureModel:
@@ -24,7 +38,7 @@ class TableStructureModel:
         page_clusters_list: List[List[Any]] = []  # per-page list of clusters
         batched_page_indexes: List[int] = []  # map batch idx -> pages_list idx
 
-        # Prepare pages (aggregate tokens per page; dedup by token id)
+        # Prepare per-page table inputs
         for page_idx, page in enumerate(pages):
 
             assert page.predictions.layout is not None
@@ -114,10 +128,18 @@ class TableStructureModel:
         tcells = None
 
         if sp is not None:
-            tcells = sp.get_cells_in_bbox(
-                cell_unit=TextCellUnit.WORD,
-                bbox=table_cluster.bbox,
-            )
+            word_store = getattr(sp, "_word_store", None)
+            if word_store is not None and hasattr(word_store, "get_cells_in_bbox"):
+                tcells = word_store.get_cells_in_bbox(
+                    bbox=table_cluster.bbox,
+                    ios=0.8,
+                    classes=_CELL_CLASSES,
+                )
+            else:
+                tcells = sp.get_cells_in_bbox(
+                    cell_unit=TextCellUnit.WORD,
+                    bbox=table_cluster.bbox,
+                )
 
             if len(tcells) == 0:
                 tcells = table_cluster.cells

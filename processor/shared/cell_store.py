@@ -83,29 +83,43 @@ class CellStore:
     
     def __len__(self) -> int:
         return self.cols.index.shape[0]
+
+    def _aabb_in_origin(self, origin: CoordOrigin) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return cached AABBs as left/right/top/bottom in the requested origin."""
+        lefts = self._xmin
+        rights = self._xmax
+
+        if origin == CoordOrigin.TOPLEFT:
+            if self.bottomleft_origin:
+                tops = self.page_height - self._ymax
+                bottoms = self.page_height - self._ymin
+            else:
+                tops = self._ymin
+                bottoms = self._ymax
+        else:
+            if self.bottomleft_origin:
+                tops = self._ymax
+                bottoms = self._ymin
+            else:
+                tops = self.page_height - self._ymin
+                bottoms = self.page_height - self._ymax
+
+        return lefts, rights, tops, bottoms
     
     def find_indices_in_bbox_ios(self, bbox: BoundingBox, ios: float = 0.8) -> np.ndarray:
         """Find cell indices that intersect bbox with given IoS threshold."""
-        # Handle coordinate origin mismatch
-        flip_needed = (bbox.coord_origin.name == "TOPLEFT") != self.bottomleft_origin
-        if flip_needed:
-            ph = self.page_height
-            ymins = ph - self._ymax
-            ymaxs = ph - self._ymin
+        lefts, rights, tops, bottoms = self._aabb_in_origin(bbox.coord_origin)
+
+        iw = np.maximum(0.0, np.minimum(rights, bbox.r) - np.maximum(lefts, bbox.l))
+
+        if bbox.coord_origin == CoordOrigin.TOPLEFT:
+            ih = np.maximum(0.0, np.minimum(bottoms, bbox.b) - np.maximum(tops, bbox.t))
         else:
-            ymins = self._ymin
-            ymaxs = self._ymax
-        
-        xmins = self._xmin
-        xmaxs = self._xmax
-        
-        # Compute intersection over self (division-free)
-        L, R, B, T = bbox.l, bbox.r, bbox.b, bbox.t
-        iw = np.maximum(0.0, np.minimum(xmaxs, R) - np.maximum(xmins, L))
-        ih = np.maximum(0.0, np.minimum(ymaxs, T) - np.maximum(ymins, B))
+            ih = np.maximum(0.0, np.minimum(tops, bbox.t) - np.maximum(bottoms, bbox.b))
+
         inter = iw * ih
-        area = (xmaxs - xmins) * (ymaxs - ymins)
-        
+        area = (rights - lefts) * np.abs(bottoms - tops)
+
         # Use > (not >=) to match original SegmentedPdfPage.get_cells_in_bbox behavior
         return np.flatnonzero(inter > ios * np.maximum(area, 1e-9))
     

@@ -461,42 +461,66 @@ class CellMatcher:
         int
             Number of total matches
         """
-        pdf_bboxes = np.asarray([p["bbox"] for p in pdf_cells])
-        pdf_bboxes_areas = (pdf_bboxes[:, 2] - pdf_bboxes[:, 0]) * (
+        return self._intersection_over_pdf_match_vectorized(table_cells, pdf_cells)
+
+    def _intersection_over_pdf_match_vectorized(self, table_cells, pdf_cells):
+        r"""
+        Vectorized equivalent of the stock intersection-over-pdf matcher.
+
+        Important semantic constraints:
+        - keep all positive overlaps
+        - preserve stock iteration order (table-cell major, then pdf-cell)
+        - do not collapse early to a single best match
+        """
+        if not table_cells or not pdf_cells:
+            return {}, 0
+
+        table_bboxes = np.asarray([c["bbox"] for c in table_cells], dtype=np.float64)  # (T, 4)
+        pdf_bboxes = np.asarray([c["bbox"] for c in pdf_cells], dtype=np.float64)  # (P, 4)
+
+        if table_bboxes.size == 0 or pdf_bboxes.size == 0:
+            return {}, 0
+
+        pdf_areas = (pdf_bboxes[:, 2] - pdf_bboxes[:, 0]) * (
             pdf_bboxes[:, 3] - pdf_bboxes[:, 1]
-        )
+        )  # (P,)
 
+        tb = table_bboxes[:, None, :]  # (T, 1, 4)
+        pb = pdf_bboxes[None, :, :]  # (1, P, 4)
+
+        ix1 = np.maximum(tb[..., 0], pb[..., 0])
+        iy1 = np.maximum(tb[..., 1], pb[..., 1])
+        ix2 = np.minimum(tb[..., 2], pb[..., 2])
+        iy2 = np.minimum(tb[..., 3], pb[..., 3])
+
+        iw = np.maximum(0.0, ix2 - ix1)
+        ih = np.maximum(0.0, iy2 - iy1)
+        inter_area = iw * ih  # (T, P)
+
+        positive_area = pdf_areas > 0.0
+        iopdf = np.zeros_like(inter_area, dtype=np.float64)
+        if np.any(positive_area):
+            iopdf[:, positive_area] = inter_area[:, positive_area] / pdf_areas[positive_area]
+
+        positive_pairs = np.flatnonzero(iopdf.ravel(order="C") > 0.0)
+        if positive_pairs.size == 0:
+            return {}, 0
+
+        num_pdf_cells = len(pdf_cells)
         matches = {}
-        matches_counter = 0
 
-        for i, table_cell in enumerate(table_cells):
-            table_cell_id = table_cell["cell_id"]
-            t_bbox = table_cell["bbox"]
+        for flat_idx in positive_pairs:
+            table_idx = int(flat_idx // num_pdf_cells)
+            pdf_idx = int(flat_idx % num_pdf_cells)
 
-            for j, pdf_cell in enumerate(pdf_cells):
-                pdf_cell_id = pdf_cell["id"]
-                p_bbox = pdf_cell["bbox"]
+            pdf_cell_id = pdf_cells[pdf_idx]["id"]
+            match = {
+                "table_cell_id": table_cells[table_idx]["cell_id"],
+                "iopdf": float(iopdf[table_idx, pdf_idx]),
+            }
+            matches.setdefault(pdf_cell_id, []).append(match)
 
-                i_bbox = find_intersection(t_bbox, p_bbox)
-                if i_bbox is None:
-                    continue
-
-                i_bbox_area = (i_bbox[2] - i_bbox[0]) * (i_bbox[3] - i_bbox[1])
-                iopdf = 0
-                if float(pdf_bboxes_areas[j]) > 0:
-                    iopdf = i_bbox_area / float(pdf_bboxes_areas[j])
-
-                if iopdf > 0:
-                    match = {"table_cell_id": table_cell_id, "iopdf": iopdf}
-                    if pdf_cell_id not in matches:
-                        matches[pdf_cell_id] = [match]
-                        matches_counter += 1
-                    else:
-                        if match not in matches[pdf_cell_id]:
-                            matches[pdf_cell_id].append(match)
-                            matches_counter += 1
-
-        return matches, matches_counter
+        return matches, int(positive_pairs.size)
 
     def _iou_match(self, table_cells, pdf_cells):
         r"""
