@@ -22,7 +22,7 @@ Or you need to backfill a million pages and don't want to pay $0.015/page for AW
 
 Turbodocling is Docling, re-architected for AWS. `cdk deploy` and you're running in minutes. Process a document by calling a Step Function. Increase GPU capacity for batch jobs and scale it back down explicitly when you're done.
 
-- **Fast.** 10 seconds for a 93-page 10-K. 2.5 seconds for a short document.
+- **Fast.** 13 seconds for a 93-page 10-K. 3 seconds for a short document.
 - **Cheap at scale.** Orders of magnitude less than Textract ($0.015/page) or Mistral OCR ($0.01/page). GPU processes 20+ pages/second and can be shared across concurrent jobs.
 - **Easy to deploy.** One `cdk deploy`. Lambda, SQS, Step Functions, ECS.
 - **Easy to integrate.** Just invoke a Step Function from your existing services.
@@ -30,10 +30,10 @@ Turbodocling is Docling, re-architected for AWS. `cdk deploy` and you're running
 
 | Document | Pages | Turbodocling | Stock Docling | Speedup |
 |---|---|---|---|---|
-| Docling paper | 8 | **2.5s** | 8.1s | 3.2x |
-| Attention paper | 15 | **4.6s** | 12.6s | 2.7x |
-| NVIDIA 10-Q (Q3 FY2026) | 48 | **6.0s** | 40.7s | **6.8x** |
-| NVIDIA 10-K (FY2026) | 93 | **9.5s** | 71.0s | **7.5x** |
+| Docling paper | 8 | **3.0s** | 8.1s | 2.7x |
+| Attention paper | 15 | **5.0s** | 12.6s | 2.5x |
+| NVIDIA 10-Q (Q3 FY2026) | 48 | **6.5s** | 40.7s | **6.3x** |
+| NVIDIA 10-K (FY2026) | 93 | **12.8s** | 71.0s | **5.5x** |
 
 ### Throughput (20x NVIDIA 10-K concurrent, 1860 pages)
 
