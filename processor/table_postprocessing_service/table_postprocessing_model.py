@@ -1,3 +1,6 @@
+import logging
+import os
+import re
 from collections.abc import Iterable
 from typing import Any, Dict, List
 from itertools import groupby
@@ -8,6 +11,8 @@ from docling_core.types.doc import BoundingBox, TableCell
 from docling.datamodel.pipeline_options import TableFormerMode
 from processor.table_postprocessing_service.matching_post_processor import MatchingPostProcessor
 from processor.table_postprocessing_service.tf_cell_matcher import CellMatcher
+
+logger = logging.getLogger(__name__)
 
 
 class bcolors:
@@ -39,6 +44,16 @@ def otsl_sqr_chk(rs_list):
 
 
 class TablePostprocessingModel:
+    # Minimum tokens in an unmatched group to qualify as a missing row.
+    _RECONCILE_MIN_TOKENS = 2
+    # Minimum distinct columns spanned to qualify as a missing row.
+    _RECONCILE_MIN_COLS = 2
+    # If too much of the table is unmatched, audit only: the table is likely structurally broken.
+    _RECONCILE_MAX_UNMATCHED_RATIO = 0.35
+    # Keep the fallback narrow; lots of orphan groups usually means a bad table, not one missing row.
+    _RECONCILE_MAX_GROUPS = 3
+    # Numeric values are often split into "$" and "5,125" style tokens.
+    _VALUE_LIKE_RE = re.compile(r"^(?:[$€£¥]|[-–—]?\(?\d[\d,]*(?:\.\d+)?\)?%?)$")
 
     def __init__(self):
         self.do_cell_matching = True
@@ -87,6 +102,9 @@ class TablePostprocessingModel:
                     matching_details = self._post_processor.process(
                         matching_details, correct_overlapping_cells,
                     )
+                    # Reconciliation: catch any tokens the full pipeline failed to match.
+                    # A malformed fallback row is always better than silent token loss.
+                    matching_details = self._reconcile_unmatched_tokens(matching_details)
 
                 docling_output = self._generate_tf_response(
                     matching_details["table_cells"], matching_details["matches"]
@@ -212,6 +230,219 @@ class TablePostprocessingModel:
             cluster=table_cluster,
             label=table_cluster.label,
         )
+
+    @classmethod
+    def _token_is_value_like(cls, text: str) -> bool:
+        return bool(cls._VALUE_LIKE_RE.match(text.strip()))
+
+    @classmethod
+    def _reconcile_unmatched_tokens(cls, matching_details):
+        """
+        Post-postprocessing audit: find PDF tokens that survived the full
+        matching + orphan-recovery pipeline without being assigned to any
+        table cell.
+
+        Only synthesizes a fallback row when unmatched tokens look like a
+        coherent missing row (>= 2 tokens, spanning >= 2 columns, no
+        existing row already at the same y-band, and at least one value-like
+        token outside the label column). Otherwise just logs the audit for
+        investigation.
+
+        Enabled by default. Set TURBODOCLING_RECONCILE_ROWS=0 to disable
+        recovery (audit logging still runs).
+
+        Uses the same cell schema as the stock orphan path in
+        MatchingPostProcessor._pick_orphan_cells().
+        """
+        from collections import defaultdict
+
+        table_cells = matching_details["table_cells"]
+        matches = matching_details["matches"]
+        pdf_cells = matching_details["pdf_cells"]
+
+        if not pdf_cells or not table_cells:
+            return matching_details
+
+        # 1. Audit: which tokens are unmatched?
+        matched_ids = set(matches.keys())
+        unmatched = [pc for pc in pdf_cells
+                     if str(pc["id"]) not in matched_ids
+                     and pc.get("text", "").strip()]
+
+        if not unmatched:
+            return matching_details
+
+        enabled = os.environ.get("TURBODOCLING_RECONCILE_ROWS", "1") == "1"
+
+        unmatched_ratio = len(unmatched) / len(pdf_cells)
+        if unmatched_ratio > cls._RECONCILE_MAX_UNMATCHED_RATIO:
+            logger.warning(
+                "RECONCILE_AUDIT: %d/%d unmatched tokens (ratio=%.2f) - audit only",
+                len(unmatched),
+                len(pdf_cells),
+                unmatched_ratio,
+            )
+            return matching_details
+
+        # 2. Build column boundaries and row y-bands from existing cells
+        col_x = defaultdict(lambda: [float('inf'), float('-inf')])
+        row_ys = defaultdict(list)
+        row_bands = defaultdict(lambda: [float('inf'), float('-inf')])
+        for tc in table_cells:
+            bb = tc["bbox"]
+            cx = col_x[tc["column_id"]]
+            if bb[0] < cx[0]:
+                cx[0] = bb[0]
+            if bb[2] > cx[1]:
+                cx[1] = bb[2]
+            row_ys[tc["row_id"]].append((bb[1] + bb[3]) / 2.0)
+            band = row_bands[tc["row_id"]]
+            if bb[1] < band[0]:
+                band[0] = bb[1]
+            if bb[3] > band[1]:
+                band[1] = bb[3]
+
+        row_y_avg = {rid: sum(v) / len(v) for rid, v in row_ys.items()}
+        sorted_avg_ys = sorted(row_y_avg.values())
+        leftmost_col = min(col_x.keys())
+
+        # Estimate row spacing for clustering threshold
+        if len(sorted_avg_ys) >= 2:
+            threshold = (sorted_avg_ys[-1] - sorted_avg_ys[0]) / (len(sorted_avg_ys) - 1) * 0.6
+        else:
+            threshold = 15.0
+
+        # 3. Cluster unmatched tokens into groups by y-proximity
+        unmatched.sort(key=lambda pc: (pc["bbox"][1] + pc["bbox"][3]) / 2.0)
+
+        groups = [[unmatched[0]]]
+        for pc in unmatched[1:]:
+            prev_y = (groups[-1][-1]["bbox"][1] + groups[-1][-1]["bbox"][3]) / 2.0
+            curr_y = (pc["bbox"][1] + pc["bbox"][3]) / 2.0
+            if curr_y - prev_y < threshold:
+                groups[-1].append(pc)
+            else:
+                groups.append([pc])
+
+        if len(groups) > cls._RECONCILE_MAX_GROUPS:
+            logger.warning(
+                "RECONCILE_AUDIT: %d unmatched groups - audit only", len(groups)
+            )
+            return matching_details
+
+        # 4. Filter: only groups that look like coherent missing rows
+        max_row = max(tc["row_id"] for tc in table_cells)
+        max_cell = max(tc["cell_id"] for tc in table_cells)
+        new_matches = dict(matches)
+        recovered = 0
+
+        for group in groups:
+            texts = [pc.get("text", "") for pc in group]
+            group_y = sum((pc["bbox"][1] + pc["bbox"][3]) / 2.0 for pc in group) / len(group)
+            group_top = min(pc["bbox"][1] for pc in group)
+            group_bottom = max(pc["bbox"][3] for pc in group)
+
+            # Check: does an existing row already occupy this y-band?
+            y_margin = min(4.0, threshold * 0.25)
+            y_occupied = any(
+                not (group_bottom < band[0] - y_margin or group_top > band[1] + y_margin)
+                for band in row_bands.values()
+            )
+
+            # Check: how many distinct columns does this group span?
+            col_assignments = set()
+            token_col_map = []
+            for pc in group:
+                pc_l, pc_r = pc["bbox"][0], pc["bbox"][2]
+                best_col = 0
+                best_overlap = 0.0
+                for col_id, (cl, cr) in col_x.items():
+                    overlap = min(pc_r, cr) - max(pc_l, cl)
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_col = col_id
+                # Only count if there's actual positive overlap
+                if best_overlap > 0:
+                    col_assignments.add(best_col)
+                token_col_map.append((pc, best_col, best_overlap))
+
+            positive_tokens = [(pc, col, overlap) for pc, col, overlap in token_col_map if overlap > 0]
+            value_like_cols = {
+                col for pc, col, _ in positive_tokens
+                if col != leftmost_col and cls._token_is_value_like(pc.get("text", ""))
+            }
+            has_label_col = leftmost_col in col_assignments
+
+            is_row_candidate = (
+                len(positive_tokens) >= cls._RECONCILE_MIN_TOKENS
+                and len(col_assignments) >= cls._RECONCILE_MIN_COLS
+                and has_label_col
+                and bool(value_like_cols)
+                and not y_occupied
+            )
+
+            if not is_row_candidate or not enabled:
+                # Audit only — log but don't modify output
+                logger.warning(
+                    "RECONCILE_AUDIT: %d unmatched tokens (row_candidate=%s, enabled=%s, "
+                    "cols=%s, value_cols=%s, y_occupied=%s): %s",
+                    len(group),
+                    is_row_candidate,
+                    enabled,
+                    sorted(col_assignments),
+                    sorted(value_like_cols),
+                    y_occupied,
+                    texts,
+                )
+                continue
+
+            # 5. Synthesize fallback row
+            max_row += 1
+            cell_id_by_col = {}
+            cell_ref_by_col = {}
+            for pc, col, _ in positive_tokens:
+                if col not in cell_id_by_col:
+                    max_cell += 1
+                    new_cell = {
+                        "bbox": pc["bbox"][:],
+                        "cell_id": max_cell,
+                        "column_id": col,
+                        "label": "body",
+                        "row_id": max_row,
+                        "cell_class": 2,
+                    }
+                    table_cells.append(new_cell)
+                    cell_id_by_col[col] = max_cell
+                    cell_ref_by_col[col] = new_cell
+                else:
+                    cell = cell_ref_by_col[col]
+                    bbox = cell["bbox"]
+                    pc_bbox = pc["bbox"]
+                    cell["bbox"] = [
+                        min(bbox[0], pc_bbox[0]),
+                        min(bbox[1], pc_bbox[1]),
+                        max(bbox[2], pc_bbox[2]),
+                        max(bbox[3], pc_bbox[3]),
+                    ]
+
+                new_matches[str(pc["id"])] = [
+                    {"post": 1.0, "table_cell_id": cell_id_by_col[col]}
+                ]
+                recovered += 1
+
+            logger.warning(
+                "RECONCILE: %d unmatched tokens -> fallback row %d across cols=%s: %s",
+                len(group),
+                max_row,
+                sorted(cell_id_by_col.keys()),
+                texts,
+            )
+
+        if recovered > 0:
+            matching_details["table_cells"] = table_cells
+            matching_details["matches"] = new_matches
+
+        return matching_details
 
     def _remove_bbox_span_desync(self, prediction):
         # Delete 1 extra bbox after span tag
