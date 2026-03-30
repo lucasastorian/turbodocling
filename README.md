@@ -20,13 +20,13 @@ Or you need to backfill a million pages and don't want to pay $0.015/page for AW
 
 ## What We Built
 
-Turbodocling is Docling, re-architected for AWS. `cdk deploy` and you're running in minutes. Process a document by calling a Step Function. Scale up for a batch job, scale back down when you're done.
+Turbodocling is Docling, re-architected for AWS. `cdk deploy` and you're running in minutes. Process a document by calling a Step Function. Increase GPU capacity for batch jobs and scale it back down explicitly when you're done.
 
 - **Fast.** 10 seconds for a 93-page 10-K. 2.5 seconds for a short document.
 - **Cheap at scale.** Orders of magnitude less than Textract ($0.015/page) or Mistral OCR ($0.01/page). GPU processes 20+ pages/second and can be shared across concurrent jobs.
 - **Easy to deploy.** One `cdk deploy`. Lambda, SQS, Step Functions, ECS.
 - **Easy to integrate.** Just invoke a Step Function from your existing services.
-- **Easy to scale.** Fan-out is automatic. Bump the GPU worker count for batch jobs, scale back to zero when idle.
+- **Easy to scale.** Lambda fan-out is automatic. GPU worker capacity is configured explicitly in the stack for batch workloads.
 
 | Document | Pages | Turbodocling | Stock Docling | Speedup |
 |---|---|---|---|---|
@@ -144,7 +144,7 @@ We optimized at every layer. Three changes account for most of the speedup.
 
 Stock Docling couples CPU and GPU work on the same machine. PDF parsing, image rendering, and page image creation all happen inline on the GPU instance. Image rendering in particular used to live inside the layout processor itself. You're paying A10G rates (~$1/hr) for pure CPU work that doesn't touch the GPU.
 
-We moved every piece of CPU work we could off the GPU and into Lambda. Parsing, rendering, and page image creation all happen in **up to 40 parallel Lambda functions** (ARM64, 1769 MB, SnapStart) via a Step Function fan-out. The GPU receives fully pre-processed pages and only runs inference. An 80-page doc that took ~40 seconds to preprocess serially now finishes in ~5 seconds wall-clock, bounded by the slowest Lambda rather than the sum.
+We moved every piece of CPU work we could off the GPU and into Lambda. Parsing, rendering, and page image creation all happen in **up to 40 parallel Lambda functions** (ARM64, 1769 MB, SnapStart) via a Step Function fan-out. The GPU receives pre-parsed pages plus cached page images and focuses on inference, postprocessing, and assembly. An 80-page doc that took ~40 seconds to preprocess serially now finishes in ~5 seconds wall-clock, bounded by the slowest Lambda rather than the sum.
 
 ```
                     ┌─ Lambda 1:  pages 1-2   [parse + render] ─┐
@@ -186,7 +186,8 @@ Beyond the two architectural changes above, we rewrote layout postprocessing, ta
 - **Spatial cluster and interval indexing.** Reading order and element clustering use interval trees and grid indices instead of O(N*M) pairwise comparisons. This was one of the bigger wins in postprocessing.
 - **Multi-threaded GPU pipeline.** Inference, layout postprocessing, table postprocessing, and assembly run on dedicated threads communicating via bounded queues with backpressure. Stages overlap instead of running sequentially.
 - **Pinned staging cache and shape bucketing.** GPU preprocessing reuses pinned memory buffers and buckets images by shape to minimize allocations and H2D transfer overhead.
-- **Render-scale cap and dual-resolution images.** Lambda generates both a layout-resolution and a table-resolution image per page, capping render scale for large pages. Avoids redundant re-rendering on the GPU side.
+- **Stock-compatible page rendering.** Lambda generates both a layout-resolution and a table-resolution image per page, and matches Docling's backend rendering path by supersampling and downsampling per requested scale. This avoids subtle layout-geometry drift from image-generation differences.
+- **Correct page-geometry reconstruction.** The columnar page payload preserves the parser's original page geometry semantics during deserialization, while text cells remain in top-left coordinates for the downstream matcher and postprocessors.
 - **Intake backpressure and concurrent downloads.** The GPU worker gates how fast it pulls batches from S3 based on downstream queue depth, and downloads PDF chunks concurrently rather than sequentially.
 - **Layout model tuning.** Stock Docling already batches layout inference in small dynamic batches (typically 4). We run fixed-size 640x640 batches of 32, channels-last + TF32 on Ampere, with GPU preprocessing and persistent streams to overlap H2D and compute.
 
@@ -241,7 +242,7 @@ The GPU worker is internally multi-threaded: dedicated threads for inference, la
 
 **GPU Worker (A10G, ECS):** Polls SQS, downloads batches, runs layout + table inference, assembles structured output (markdown + elements JSON).
 
-**Batch sizing:** `ceil(total_pages / 40)` pages per Lambda, so an 80-page doc fans out across 40 parallel invocations.
+**Batch sizing:** the Step Function uses a stepped rule: 1 page/batch up to 40 pages, 2 up to 80, 3 up to 120, 4 up to 160, 5 up to 200, and 6 beyond that. So an 80-page doc fans out across 40 parallel invocations; larger docs cap at 6 pages per Lambda batch.
 
 ### GPU Memory and Concurrency
 
