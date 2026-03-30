@@ -1,13 +1,13 @@
+import logging
 from typing import Any, Dict, List
 
-from docling_core.types.doc import BoundingBox, DocItemLabel, TableCell, CoordOrigin, TextDirection
-from docling_core.types.doc.page import TextCellUnit, TextCell, PdfTextCell, BoundingRectangle, ColorRGBA, PdfCellRenderingMode
+from docling_core.types.doc import BoundingBox, DocItemLabel, TableCell
+from docling_core.types.doc.page import TextCellUnit
 from docling.datamodel.base_models import Table, TableStructurePrediction, Page
 
-from .table_preprocessor import TablePreprocessor
+logger = logging.getLogger(__name__)
 
-# Classes tuple for CellStore.get_cells_in_bbox()
-_CELL_CLASSES = (TextCell, PdfTextCell, BoundingRectangle, CoordOrigin, TextDirection, ColorRGBA, PdfCellRenderingMode)
+from .table_preprocessor import TablePreprocessor
 
 
 class TableStructureModel:
@@ -47,24 +47,24 @@ class TableStructureModel:
             page_table_bboxes: List[List[float]] = []
             page_clusters: List[Any] = []
 
-            if self.do_cell_matching:
-                seen_ids = set()
-                aggregated_tokens: List[dict] = []
-                for table_cluster, tbl_box in in_tables:
+            # Build per-table token lists (matching stock behavior).
+            # Each table gets only the tokens inside its own bbox,
+            # NOT the aggregated page-level token universe.
+            per_table_tokens: List[List[dict]] = []
+            for table_cluster, tbl_box in in_tables:
+                if self.do_cell_matching:
                     toks = self._get_table_tokens(page, table_cluster, scale=scale)
-                    for tok in toks:
-                        tid = tok.get("id")
-                        if tid is None or tid in seen_ids:
-                            continue
-                        seen_ids.add(tid)
-                        aggregated_tokens.append(tok)
-                    page_table_bboxes.append(tbl_box)
-                    page_clusters.append(table_cluster)
-                page_input["tokens"] = aggregated_tokens
-            else:
-                for table_cluster, tbl_box in in_tables:
-                    page_table_bboxes.append(tbl_box)
-                    page_clusters.append(table_cluster)
+                else:
+                    toks = []
+
+                per_table_tokens.append(toks)
+                page_table_bboxes.append(tbl_box)
+                page_clusters.append(table_cluster)
+
+            # Store per-table tokens on the page_input for downstream use
+            page_input["per_table_tokens"] = per_table_tokens
+            # Keep a dummy "tokens" key for backward compat (unused by fixed path)
+            page_input["tokens"] = []
 
             page_inputs.append(page_input)
             table_bboxes_list.append(page_table_bboxes)
@@ -104,26 +104,20 @@ class TableStructureModel:
             if cluster.label in (DocItemLabel.TABLE, DocItemLabel.DOCUMENT_INDEX)
         ]
 
-    def _get_table_tokens(self, page: Page, table_cluster, ios: float = 0.8, scale: float = 2.0):
+    def _get_table_tokens(self, page: Page, table_cluster, scale: float = 2.0):
         """
-        Token aggregation via Page.word_index (TOP-LEFT origin).
-        Uses vectorized CellStore query when available, falls back to iteration.
+        Match stock semantics as closely as possible:
+        query word cells directly from the segmented page for the table bbox,
+        and only fall back to cluster cells when no word cells are returned.
         """
         sp = page.parsed_page
         tcells = None
 
         if sp is not None:
-            # Fast path: use CellStore's vectorized spatial query if available
-            word_store = getattr(sp, '_word_store', None)
-            if word_store is not None and hasattr(word_store, 'get_cells_in_bbox'):
-                tcells = word_store.get_cells_in_bbox(table_cluster.bbox, ios, _CELL_CLASSES)
-            else:
-                # Fallback: iterate all cells (slow for large documents)
-                tcells = sp.get_cells_in_bbox(
-                    cell_unit=TextCellUnit.WORD,
-                    bbox=table_cluster.bbox,
-                    ios=ios,
-                )
+            tcells = sp.get_cells_in_bbox(
+                cell_unit=TextCellUnit.WORD,
+                bbox=table_cluster.bbox,
+            )
 
             if len(tcells) == 0:
                 tcells = table_cluster.cells

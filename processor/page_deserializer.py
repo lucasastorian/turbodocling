@@ -7,7 +7,7 @@ from PIL import Image
 from docling.datamodel.base_models import Page
 from docling_core.types.doc.page import (
     SegmentedPdfPage, PdfPageGeometry, TextCell, PdfTextCell,
-    BoundingRectangle, ColorRGBA, PdfCellRenderingMode,
+    BoundingRectangle, ColorRGBA, PdfCellRenderingMode, PdfPageBoundaryType,
 )
 from docling_core.types.doc import Size, BoundingBox, CoordOrigin, TextDirection
 
@@ -80,42 +80,45 @@ def reconstruct_page(page_dict: Dict) -> Page:
         dim_dict = segmented_dict['dimension']
         page_height = segmented_dict['page_height']
 
+        # The packed page geometry preserves the original parser semantics:
+        # page boxes are stored in bottom-left coordinates, even though text cells
+        # are flipped to top-left before serialization.
         crop_bbox = BoundingBox(
             l=dim_dict['crop_bbox'][0], t=dim_dict['crop_bbox'][1],
             r=dim_dict['crop_bbox'][2], b=dim_dict['crop_bbox'][3],
-            coord_origin=CoordOrigin.TOPLEFT,
+            coord_origin=CoordOrigin.BOTTOMLEFT,
         )
         rect = BoundingRectangle(
-            r_x0=crop_bbox.l, r_y0=crop_bbox.t,
-            r_x1=crop_bbox.r, r_y1=crop_bbox.t,
-            r_x2=crop_bbox.r, r_y2=crop_bbox.b,
-            r_x3=crop_bbox.l, r_y3=crop_bbox.b,
-            coord_origin=CoordOrigin.TOPLEFT,
+            r_x0=crop_bbox.l, r_y0=crop_bbox.b,
+            r_x1=crop_bbox.r, r_y1=crop_bbox.b,
+            r_x2=crop_bbox.r, r_y2=crop_bbox.t,
+            r_x3=crop_bbox.l, r_y3=crop_bbox.t,
+            coord_origin=CoordOrigin.BOTTOMLEFT,
         )
         dimension = PdfPageGeometry.model_construct(
             angle=dim_dict['angle'],
             rect=rect,
-            boundary_type=dim_dict['boundary_type'],
+            boundary_type=PdfPageBoundaryType(dim_dict['boundary_type']),
             crop_bbox=crop_bbox,
             media_bbox=BoundingBox(
                 l=dim_dict['media_bbox'][0], t=dim_dict['media_bbox'][1],
                 r=dim_dict['media_bbox'][2], b=dim_dict['media_bbox'][3],
-                coord_origin=CoordOrigin.TOPLEFT,
+                coord_origin=CoordOrigin.BOTTOMLEFT,
             ),
             art_bbox=BoundingBox(
                 l=dim_dict['art_bbox'][0], t=dim_dict['art_bbox'][1],
                 r=dim_dict['art_bbox'][2], b=dim_dict['art_bbox'][3],
-                coord_origin=CoordOrigin.TOPLEFT,
+                coord_origin=CoordOrigin.BOTTOMLEFT,
             ),
             bleed_bbox=BoundingBox(
                 l=dim_dict['bleed_bbox'][0], t=dim_dict['bleed_bbox'][1],
                 r=dim_dict['bleed_bbox'][2], b=dim_dict['bleed_bbox'][3],
-                coord_origin=CoordOrigin.TOPLEFT,
+                coord_origin=CoordOrigin.BOTTOMLEFT,
             ),
             trim_bbox=BoundingBox(
                 l=dim_dict['trim_bbox'][0], t=dim_dict['trim_bbox'][1],
                 r=dim_dict['trim_bbox'][2], b=dim_dict['trim_bbox'][3],
-                coord_origin=CoordOrigin.TOPLEFT,
+                coord_origin=CoordOrigin.BOTTOMLEFT,
             ),
         )
 

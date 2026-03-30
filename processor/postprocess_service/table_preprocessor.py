@@ -38,6 +38,9 @@ class TablePreprocessor:
             H, W = img.shape[:2]
             scale_factor = 1024.0 / float(H)
 
+            # Per-table tokens (if available); fall back to page-level tokens
+            per_table_tokens = page_input.get("per_table_tokens", None)
+
             # Local aliases to reduce attribute lookups in the inner loop
             _resize = cv2.resize
             _append_img = all_table_images.append
@@ -45,7 +48,7 @@ class TablePreprocessor:
             _append_scale = all_scale_factors.append
             _append_page = all_iocr_pages.append
 
-            for x1, y1, x2, y2 in page_tbl_bboxes:
+            for tbl_idx, (x1, y1, x2, y2) in enumerate(page_tbl_bboxes):
                 # Integer crop coordinates in original page space
                 ix1 = int(round(x1));
                 iy1 = int(round(y1))
@@ -74,7 +77,17 @@ class TablePreprocessor:
                 _append_img(resized_crop)
                 _append_bbox([x1 * scale_factor, y1 * scale_factor, x2 * scale_factor, y2 * scale_factor])
                 _append_scale(scale_factor)
-                _append_page(page_input)
+
+                # Build per-table iocr_page with only this table's tokens
+                if per_table_tokens is not None:
+                    table_iocr = {
+                        "width": page_input["width"],
+                        "height": page_input["height"],
+                        "tokens": per_table_tokens[tbl_idx],
+                    }
+                    _append_page(table_iocr)
+                else:
+                    _append_page(page_input)
 
         return {
             'iocr_pages': all_iocr_pages,

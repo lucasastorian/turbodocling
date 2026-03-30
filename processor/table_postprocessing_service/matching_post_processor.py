@@ -1207,6 +1207,7 @@ class MatchingPostProcessor:
             pdf_cells = self._clear_pdf_cells(matching_details["pdf_cells"])
             matches = matching_details["matches"]
 
+
         # ------------------------------------------------------------------------------------------
         # -1. If initial (IOU) matches are empty,
         # generate new ones based on intersection over cell
@@ -1300,6 +1301,7 @@ class MatchingPostProcessor:
             )
             intersection_pdf_matches = ip
 
+
         # 6. NOT USED
 
         # 7. De-duplicate columns in aligned_table_cells
@@ -1312,6 +1314,7 @@ class MatchingPostProcessor:
             dedupl_table_cells = dd1
             dedupl_matches = dd2
 
+
         self._log().debug("...")
 
         # 8. Do final assignment of table bbox to pdf cell based on saved scores,
@@ -1322,6 +1325,7 @@ class MatchingPostProcessor:
             final_matches = self._do_final_asignment(
                 dedupl_table_cells, matches, dedupl_matches
             )
+
 
         # 8.a. Re-align bboxes / re-run matching
         with timer.time_section('pp_align_to_pdf'):
@@ -1351,6 +1355,7 @@ class MatchingPostProcessor:
             final_matches_wo = po1
             table_cells_wo = po2
             max_cell_id = po3
+
 
         if correct_overlapping_cells:
             # As the last step - correct cell bboxes in a way that they don't overlap:

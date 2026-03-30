@@ -106,10 +106,9 @@ class PreprocessingPipeline:
             long_side = max(size.width, size.height)
             scale_2x = min(2.0, self.MAX_2X_PIXELS / long_side)
 
+            img1 = self._get_page_image(pdf_page, size, scale=1.0, cropbox=None)
             img2 = self._get_page_image(pdf_page, size, scale=scale_2x, cropbox=None)
             t_render = time.time()
-
-            img1 = img2.resize((img2.width // 2, img2.height // 2), Image.Resampling.LANCZOS)
 
             img2_webp = self._convert_to_webp(img=img2)
             img1_webp = self._convert_to_webp(img=img1)
@@ -168,7 +167,13 @@ class PreprocessingPipeline:
             padbox.r = page_size.width - padbox.r
             padbox.t = page_size.height - padbox.t
 
-        img = page.render(scale=scale, rotation=0, crop=padbox.as_tuple()).to_pil()
+        # CRITICAL: Render at 1.5x the target scale, then downsample to match stock
+        # Docling's backend (docling_parse_v4_backend.py). The layout model is sensitive
+        # to sub-pixel rendering differences — rendering directly at `scale` instead of
+        # supersampling produces slightly different table bboxes from layout, which cascade
+        # through _translate_bboxes() into structurally different table cell geometry
+        # (e.g. 8.9px row overlap causing "Other" / "Total other assets" to merge).
+        img = page.render(scale=scale * 1.5, rotation=0, crop=padbox.as_tuple()).to_pil()
 
         return img.resize(size=(round(cropbox.width * scale), round(cropbox.height * scale)))
 
