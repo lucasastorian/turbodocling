@@ -5132,10 +5132,10 @@
       "postprocess_ms": 0.0
     }
   ],
-  "preprocess_ms": 10957.019749999745,
-  "layout_ms": 356981.69650000636,
-  "table_prep_ms": 643.3684999938123,
-  "table_inference_ms": 222409.91329198005,
-  "table_postprocess_ms": 235.97191600129008,
-  "total_ms": 592030.5286250077
+  "preprocess_ms": 10944.573916989611,
+  "layout_ms": 6507.653417007532,
+  "table_prep_ms": 658.0440000107046,
+  "table_inference_ms": 7121.782499976689,
+  "table_postprocess_ms": 245.30545799643733,
+  "total_ms": 26038.057166995713
 }

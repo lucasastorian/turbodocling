@@ -35,6 +35,89 @@ def _mlx_to_torch(a: mx.array, device: str = "mps", dtype=torch.bfloat16) -> tor
     return torch.from_numpy(np.array(a, copy=False).astype(np.float32)).to(dtype=dtype, device=device)
 
 
+class MLXEncoderLayer:
+    """Standard transformer encoder layer in MLX (self-attn + FFN + LayerNorm)."""
+
+    def __init__(self, embed_dim: int, num_heads: int):
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+
+    @classmethod
+    def from_torch_layer(cls, layer, embed_dim: int, num_heads: int, use_fp32: bool = False) -> "MLXEncoderLayer":
+        obj = cls(embed_dim, num_heads)
+        convert = _torch_to_mlx if use_fp32 else _torch_to_mlx_bf16
+
+        mha = layer.self_attn
+        obj.sa_qkv_weight = convert(mha.in_proj_weight)
+        obj.sa_qkv_bias = convert(mha.in_proj_bias)
+        obj.sa_out_weight = convert(mha.out_proj.weight)
+        obj.sa_out_bias = convert(mha.out_proj.bias)
+        obj.norm1_weight = convert(layer.norm1.weight)
+        obj.norm1_bias = convert(layer.norm1.bias)
+
+        obj.ffn_w1 = convert(layer.linear1.weight)
+        obj.ffn_b1 = convert(layer.linear1.bias)
+        obj.ffn_w2 = convert(layer.linear2.weight)
+        obj.ffn_b2 = convert(layer.linear2.bias)
+        obj.norm2_weight = convert(layer.norm2.weight)
+        obj.norm2_bias = convert(layer.norm2.bias)
+
+        return obj
+
+    def __call__(self, x: mx.array) -> mx.array:
+        """x: [S, B, D] — standard transformer encoder semantics."""
+        E = self.embed_dim
+        H = self.num_heads
+        Dh = self.head_dim
+        S, B, D = x.shape
+
+        # Self-attention
+        qkv = x.reshape(S * B, D) @ self.sa_qkv_weight.T + self.sa_qkv_bias  # [S*B, 3E]
+        q, k, v = mx.split(qkv, 3, axis=-1)  # each [S*B, E]
+
+        q = q.reshape(S, B, H, Dh).transpose(1, 2, 0, 3)  # [B, H, S, Dh]
+        k = k.reshape(S, B, H, Dh).transpose(1, 2, 0, 3)
+        v = v.reshape(S, B, H, Dh).transpose(1, 2, 0, 3)
+
+        scale = math.sqrt(Dh)
+        attn = (q @ mx.transpose(k, (0, 1, 3, 2))) / scale  # [B, H, S, S]
+        attn = mx.softmax(attn, axis=-1)
+        sa_out = attn @ v  # [B, H, S, Dh]
+
+        sa_out = sa_out.transpose(2, 0, 1, 3).reshape(S, B, E)  # [S, B, E]
+        sa_out = sa_out.reshape(S * B, E) @ self.sa_out_weight.T + self.sa_out_bias
+        sa_out = sa_out.reshape(S, B, E)
+
+        x = _layer_norm(x + sa_out, self.norm1_weight, self.norm1_bias)
+
+        # FFN
+        ff = x.reshape(S * B, D) @ self.ffn_w1.T + self.ffn_b1
+        ff = mx.maximum(ff, 0)  # ReLU
+        ff = ff @ self.ffn_w2.T + self.ffn_b2
+        ff = ff.reshape(S, B, E)
+
+        x = _layer_norm(x + ff, self.norm2_weight, self.norm2_bias)
+        return x
+
+
+class MLXTransformerEncoder:
+    """Stack of MLX encoder layers, matching nn.TransformerEncoder."""
+
+    def __init__(self, layers: List[MLXEncoderLayer]):
+        self.layers = layers
+
+    @classmethod
+    def from_torch_encoder(cls, torch_encoder, embed_dim: int, num_heads: int, use_fp32: bool = True) -> "MLXTransformerEncoder":
+        layers = [MLXEncoderLayer.from_torch_layer(l, embed_dim, num_heads, use_fp32=use_fp32) for l in torch_encoder.layers]
+        return cls(layers)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
 class MLXDecoderLayer:
     """One transformer decoder layer with self-attn KV cache + cross-attn."""
 
@@ -69,48 +152,51 @@ class MLXDecoderLayer:
         self.norm3_bias = None
 
     @classmethod
-    def from_torch_layer(cls, layer, embed_dim: int, num_heads: int) -> "MLXDecoderLayer":
+    def from_torch_layer(cls, layer, embed_dim: int, num_heads: int, use_fp32: bool = True) -> "MLXDecoderLayer":
         """Extract weights from a PyTorch TMTransformerDecoderLayer."""
         obj = cls(embed_dim, num_heads)
         E = embed_dim
+        # Use fp32 for MLX decoder to match PyTorch MPS parity.
+        # bf16 was tuned for CUDA Flash Attention which MLX doesn't have.
+        convert = _torch_to_mlx if use_fp32 else _torch_to_mlx_bf16
 
         # Self-attention (fused QKV)
         mha = layer.self_attn
-        obj.sa_qkv_weight = _torch_to_mlx_bf16(mha.in_proj_weight)  # [3E, E]
-        obj.sa_qkv_bias = _torch_to_mlx_bf16(mha.in_proj_bias)
-        obj.sa_out_weight = _torch_to_mlx_bf16(mha.out_proj.weight)
-        obj.sa_out_bias = _torch_to_mlx_bf16(mha.out_proj.bias)
+        obj.sa_qkv_weight = convert(mha.in_proj_weight)
+        obj.sa_qkv_bias = convert(mha.in_proj_bias)
+        obj.sa_out_weight = convert(mha.out_proj.weight)
+        obj.sa_out_bias = convert(mha.out_proj.bias)
 
         # Norm1
-        obj.norm1_weight = _torch_to_mlx_bf16(layer.norm1.weight)
-        obj.norm1_bias = _torch_to_mlx_bf16(layer.norm1.bias)
+        obj.norm1_weight = convert(layer.norm1.weight)
+        obj.norm1_bias = convert(layer.norm1.bias)
 
-        # Cross-attention (store K/V projection weights too for precompute)
+        # Cross-attention
         ca = layer.multihead_attn
         W = ca.in_proj_weight
         b = ca.in_proj_bias
-        obj.ca_q_weight = _torch_to_mlx_bf16(W[:E, :])
-        obj.ca_q_bias = _torch_to_mlx_bf16(b[:E]) if b is not None else None
-        obj.ca_k_weight = _torch_to_mlx_bf16(W[E:2*E, :])
-        obj.ca_k_bias = _torch_to_mlx_bf16(b[E:2*E]) if b is not None else None
-        obj.ca_v_weight = _torch_to_mlx_bf16(W[2*E:, :])
-        obj.ca_v_bias = _torch_to_mlx_bf16(b[2*E:]) if b is not None else None
-        obj.ca_out_weight = _torch_to_mlx_bf16(ca.out_proj.weight)
-        obj.ca_out_bias = _torch_to_mlx_bf16(ca.out_proj.bias)
+        obj.ca_q_weight = convert(W[:E, :])
+        obj.ca_q_bias = convert(b[:E]) if b is not None else None
+        obj.ca_k_weight = convert(W[E:2*E, :])
+        obj.ca_k_bias = convert(b[E:2*E]) if b is not None else None
+        obj.ca_v_weight = convert(W[2*E:, :])
+        obj.ca_v_bias = convert(b[2*E:]) if b is not None else None
+        obj.ca_out_weight = convert(ca.out_proj.weight)
+        obj.ca_out_bias = convert(ca.out_proj.bias)
 
         # Norm2
-        obj.norm2_weight = _torch_to_mlx_bf16(layer.norm2.weight)
-        obj.norm2_bias = _torch_to_mlx_bf16(layer.norm2.bias)
+        obj.norm2_weight = convert(layer.norm2.weight)
+        obj.norm2_bias = convert(layer.norm2.bias)
 
         # FFN
-        obj.ffn_w1 = _torch_to_mlx_bf16(layer.linear1.weight)
-        obj.ffn_b1 = _torch_to_mlx_bf16(layer.linear1.bias)
-        obj.ffn_w2 = _torch_to_mlx_bf16(layer.linear2.weight)
-        obj.ffn_b2 = _torch_to_mlx_bf16(layer.linear2.bias)
+        obj.ffn_w1 = convert(layer.linear1.weight)
+        obj.ffn_b1 = convert(layer.linear1.bias)
+        obj.ffn_w2 = convert(layer.linear2.weight)
+        obj.ffn_b2 = convert(layer.linear2.bias)
 
         # Norm3
-        obj.norm3_weight = _torch_to_mlx_bf16(layer.norm3.weight)
-        obj.norm3_bias = _torch_to_mlx_bf16(layer.norm3.bias)
+        obj.norm3_weight = convert(layer.norm3.weight)
+        obj.norm3_bias = convert(layer.norm3.bias)
 
         return obj
 
@@ -181,10 +267,11 @@ def _layer_norm(x: mx.array, weight: mx.array, bias: mx.array, eps: float = 1e-5
 
 
 class MLXTagDecoder:
-    """Full MLX tag decoder with device-native decode loop."""
+    """Full MLX tag decoder with transformer encoder + decode loop."""
 
     def __init__(
         self,
+        encoder: MLXTransformerEncoder,
         layers: List[MLXDecoderLayer],
         embedding_weight: mx.array,   # [V, D]
         pe: mx.array,                 # [max_len, D]
@@ -194,6 +281,7 @@ class MLXTagDecoder:
         num_heads: int,
         embed_dim: int,
     ):
+        self.encoder = encoder
         self.layers = layers
         self.embedding_weight = embedding_weight
         self.pe = pe
@@ -233,24 +321,29 @@ class MLXTagDecoder:
         tt = model._tag_transformer
         wm = model._init_data["word_map"]["word_map_tag"]
 
-        # Extract decoder layers
-        layers = []
         E = tt._decoder_dim
         H = tt._decoder.layers[0].self_attn.num_heads
+
+        # Encoder
+        encoder = MLXTransformerEncoder.from_torch_encoder(tt._encoder, E, H)
+
+        # Decoder layers
+        layers = []
         for torch_layer in tt._decoder.layers:
             layers.append(MLXDecoderLayer.from_torch_layer(torch_layer, E, H))
 
-        # Embedding
-        emb_weight = _torch_to_mlx_bf16(tt._embedding.weight)
+        # Embedding (fp32 for parity)
+        emb_weight = _torch_to_mlx(tt._embedding.weight)
 
         # Positional encoding
-        pe = _torch_to_mlx_bf16(tt._positional_encoding.pe.squeeze(1))  # [max_len, D]
+        pe = _torch_to_mlx(tt._positional_encoding.pe.squeeze(1))  # [max_len, D]
 
         # FC head
-        fc_weight = _torch_to_mlx_bf16(tt._fc.weight)
-        fc_bias = _torch_to_mlx_bf16(tt._fc.bias)
+        fc_weight = _torch_to_mlx(tt._fc.weight)
+        fc_bias = _torch_to_mlx(tt._fc.bias)
 
         return cls(
+            encoder=encoder,
             layers=layers,
             embedding_weight=emb_weight,
             pe=pe,
@@ -261,26 +354,53 @@ class MLXTagDecoder:
             embed_dim=E,
         )
 
-    def precompute_mem_kv(self, mem_enc_torch: torch.Tensor) -> List[Tuple[mx.array, mx.array]]:
+    def _precompute_mem_kv_mlx(self, mem_enc: mx.array) -> List[Tuple[mx.array, mx.array]]:
         """
-        Precompute cross-attention K/V from encoder memory using MLX.
-        mem_enc_torch: [S, B, D] from PyTorch encoder.
+        Precompute cross-attention K/V from encoder memory (already on MLX).
+        mem_enc: [S, B, D].
         Returns: list of (K_mem, V_mem) per layer, each [B, H, S, Dh].
         """
-        # Convert [S, B, D] -> [B, S, D]
-        mem = _torch_to_mlx_bf16(mem_enc_torch.transpose(0, 1))
+        # [S, B, D] -> [B, S, D]
+        mem = mem_enc.transpose(1, 0, 2)
         B, S, D = mem.shape
         H = self.num_heads
         Dh = self.head_dim
 
+        mem_flat = mem.reshape(B * S, D)
         mem_kv = []
         for layer in self.layers:
-            K = (mem @ layer.ca_k_weight.T + layer.ca_k_bias).reshape(B, S, H, Dh).transpose(0, 2, 1, 3)
-            V = (mem @ layer.ca_v_weight.T + layer.ca_v_bias).reshape(B, S, H, Dh).transpose(0, 2, 1, 3)
-            mem_kv.append((K, V))  # each [B, H, S, Dh]
+            K = (mem_flat @ layer.ca_k_weight.T + layer.ca_k_bias).reshape(B, S, H, Dh).transpose(0, 2, 1, 3)
+            V = (mem_flat @ layer.ca_v_weight.T + layer.ca_v_bias).reshape(B, S, H, Dh).transpose(0, 2, 1, 3)
+            mem_kv.append((K, V))
 
-        mx.eval(*[k for pair in mem_kv for k in pair])  # Force compute
+        mx.eval(*[k for pair in mem_kv for k in pair])
         return mem_kv
+
+    def encode_and_decode(
+        self,
+        filtered_torch: torch.Tensor,  # [B, C, h, w] post input_filter, FP32
+        max_steps: int,
+    ) -> Tuple[mx.array, mx.array, mx.array]:
+        """
+        Run transformer encoder + decode loop entirely on MLX.
+        Takes the input_filter output from PyTorch, converts once.
+
+        Returns:
+            tag_ids, tag_hidden, lengths
+        """
+        # Convert filtered features to MLX: [B, C, h, w] → [S, B, D]
+        # Use fp32 for the encoder to minimize numeric drift, then cast to bf16 for decoder
+        filtered_mlx = _torch_to_mlx(filtered_torch.permute(0, 2, 3, 1))  # [B, h, w, C] FP32
+        B, h, w, C = filtered_mlx.shape
+        mem = filtered_mlx.reshape(B, h * w, C).transpose(1, 0, 2)  # [S, B, D] where S=h*w
+
+        # Run transformer encoder on MLX (fp32 for parity, then cast to bf16 for decoder)
+        mem_enc = self.encoder(mem)
+        mem_enc = mem_enc.astype(mx.bfloat16)
+        mx.eval(mem_enc)
+
+        # Precompute cross-attention K/V and decode
+        return self._decode_from_mem(mem_enc, max_steps)
 
     def decode(
         self,
@@ -288,14 +408,21 @@ class MLXTagDecoder:
         max_steps: int,
     ) -> Tuple[mx.array, mx.array, mx.array]:
         """
-        Run the full decode loop on MLX.
-
-        Returns:
-            tag_ids: [B, T] decoded token IDs
-            tag_hidden: [B, max_emit, D] hidden states for bbox emission
-            lengths: [B] actual sequence lengths
+        Decode-only path (encoder already run on PyTorch).
+        Processes tables one at a time to avoid padding-induced attention
+        drift in batched mode. Still fast because MLX per-table decode
+        is ~50ms.
         """
-        mem_kv = self.precompute_mem_kv(mem_enc_torch)
+        mem_enc = _torch_to_mlx(mem_enc_torch)
+        return self._decode_from_mem(mem_enc, max_steps)
+
+    def _decode_from_mem(
+        self,
+        mem_enc: mx.array,  # [S, B, D] already on MLX
+        max_steps: int,
+    ) -> Tuple[mx.array, mx.array, mx.array]:
+        """Core decode loop. mem_enc is already on MLX."""
+        mem_kv = self._precompute_mem_kv_mlx(mem_enc)
 
         B = mem_kv[0][0].shape[0]
         H = self.num_heads
@@ -306,12 +433,12 @@ class MLXTagDecoder:
         tag_ids = mx.full((B, max_steps + 1), self.end_id, dtype=mx.int32)
         tag_ids[:, 0] = self.start_id
 
-        # KV caches per layer: [B, H, max_steps, Dh]
-        sa_k_caches = [mx.zeros((B, H, max_steps + 1, Dh), dtype=mx.bfloat16) for _ in range(self.n_layers)]
-        sa_v_caches = [mx.zeros((B, H, max_steps + 1, Dh), dtype=mx.bfloat16) for _ in range(self.n_layers)]
+        # KV caches per layer: [B, H, max_steps, Dh] — fp32 for parity
+        sa_k_caches = [mx.zeros((B, H, max_steps + 1, Dh), dtype=mx.float32) for _ in range(self.n_layers)]
+        sa_v_caches = [mx.zeros((B, H, max_steps + 1, Dh), dtype=mx.float32) for _ in range(self.n_layers)]
 
         # Hidden state buffer for bbox emission
-        tag_H_buffer = mx.zeros((B, max_steps, D), dtype=mx.bfloat16)
+        tag_H_buffer = mx.zeros((B, max_steps, D), dtype=mx.float32)
         tag_H_counts = mx.zeros((B,), dtype=mx.int32)
 
         # All control state on host (numpy) — tiny, not worth device ops.
@@ -322,6 +449,11 @@ class MLXTagDecoder:
         prev_ucel = np.zeros(B, dtype=np.bool_)
         lengths = np.zeros(B, dtype=np.int32)
         h_counts = np.zeros(B, dtype=np.int32)  # host-side bbox emission counter
+
+        # Span tracking for lcel merge (matches torch batched decoder)
+        open_span_start = np.full(B, -1, dtype=np.int32)
+        span_starts_list = [[] for _ in range(B)]
+        span_ends_list = [[] for _ in range(B)]
 
         # Track token IDs on host too (tiny)
         tag_ids_np = np.full((B, max_steps + 1), self.end_id, dtype=np.int32)
@@ -374,7 +506,7 @@ class MLXTagDecoder:
             m_first_lcel = first_lcel & m_is_lcel & (~finished)
             append_mask = m_emit | m_first_lcel
 
-            # Store hidden states for bbox
+            # Store hidden states for bbox + track spans
             emit_indices = np.where(append_mask)[0]
             if len(emit_indices) > 0:
                 for b_idx in emit_indices:
@@ -382,6 +514,18 @@ class MLXTagDecoder:
                     bi = int(b_idx)
                     if c < max_steps:
                         tag_H_buffer = tag_H_buffer.at[bi, c, :].add(x[bi])
+
+                        # Span tracking (matches torch batched decoder)
+                        is_first_lcel_here = bool(m_first_lcel[b_idx])
+                        is_emit_here = bool(m_emit[b_idx])
+
+                        if is_first_lcel_here:
+                            open_span_start[b_idx] = c
+                        elif is_emit_here and not m_is_lcel[b_idx] and open_span_start[b_idx] >= 0:
+                            span_starts_list[b_idx].append(int(open_span_start[b_idx]))
+                            span_ends_list[b_idx].append(c)
+                            open_span_start[b_idx] = -1
+
                         h_counts[b_idx] = c + 1
 
             # Update flags
@@ -394,5 +538,10 @@ class MLXTagDecoder:
             finished = finished | newly_finished
             if finished.all():
                 break
+
+        # Store h_counts and span info for bbox decoder integration
+        self._last_h_counts = h_counts
+        self._last_span_starts = span_starts_list
+        self._last_span_ends = span_ends_list
 
         return mx.array(tag_ids_np), tag_H_buffer, mx.array(lengths)

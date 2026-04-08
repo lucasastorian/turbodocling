@@ -60,9 +60,53 @@ Branch: `tableformer-mlx-decode`
 
 This is the naive version with per-step `mx.eval()` + numpy sync for argmax. The speedup comes purely from eliminating PyTorch MPS kernel dispatch overhead. MLX attention/MLP kernels are also faster for the small q_len=1 incremental decode pattern.
 
+**Full pipeline integration**: When wired into the actual model (encoder on MPS → MLX decode → bbox on MPS), the torch↔MLX conversion overhead at boundaries (~250ms for mem_enc and tag_H) eats the decode speedup. Warm PyTorch MPS: 322ms decode vs MLX hybrid: 580ms (including conversions).
+
+**Key insight**: The MLX decode kernel is genuinely faster (205ms vs 720ms cold), but the data conversion between PyTorch and MLX tensors is expensive. To realize the gain, either:
+1. Move the encoder + transformer encoder to MLX too (eliminates mem_enc conversion)
+2. Or find a zero-copy path between MPS tensors and MLX arrays (DLPack?)
+
+## Experiment 4: MLX transformer encoder + decoder (full MLX path)
+
+**Rationale**: Eliminate the torch→MLX conversion boundary by running both the transformer encoder and tag decoder on MLX. Only the ResNet encoder + input_filter stays on PyTorch MPS.
+
+**Result (3 tables, warm)**:
+- PyTorch MPS full path: 336ms
+- **MLX encoder+decoder: 168ms — 2x faster**
+
+**Result (44 tables, full 10-Q)**:
+- PyTorch MPS: 7.8s (177ms/table)
+- **MLX encoder+decoder: 4.5s (109ms/table) — 1.7x faster**
+- **But: 93 regressions against golden**
+
+The regressions are structural (row drops: 19→18, 23→22 etc.) caused by MLX transformer encoder producing slightly different attention outputs than PyTorch. Greedy autoregressive decode amplifies these tiny differences into token flips.
+
+**FP32 encoder test**: Still 93 regressions. The drift isn't from bf16 precision alone — it's from the attention implementation differences (softmax accumulation order, LayerNorm reductions).
+
+**Key finding**: The "safe" MLX boundary is at `mem_enc`, not at `filtered_nchw`. Moving the transformer encoder into MLX crosses a parity threshold that the autoregressive decoder cannot tolerate.
+
+**End-to-end local pipeline**: 18.8s for 48 pages (vs 24s PyTorch MPS). 20% faster overall but with quality regressions.
+
 ---
 
-## Next experiments to try
+## Summary of findings
+
+| Path | Speed | Parity | Verdict |
+|---|---|---|---|
+| MLX decode only | 3.5x faster decode | 100% | ✅ Concept proven |
+| Hybrid torch→MLX→torch | Slower than baseline | 100% | ❌ Conversion tax kills it |
+| MLX encoder+decoder | 2x faster | 93 regressions | ⚠️ Fast but unstable |
+
+**The bottleneck is dispatch overhead, not compute.** MLX proves this. But the encoder parity problem means the integrated MLX path needs more work.
+
+---
+
+## Next steps (prioritized)
+
+1. **fp32 parity triage** — per-layer encoder diff to find where drift starts. Half-day experiment for go/no-go on MLX encoder.
+2. **Torch/CUDA state machine regularization** — apply MLX lessons: tensorize flags, fixed-step masked loop, store all hidden states + compact after decode. No framework boundary tax.
+3. **Zero-copy interop** — test DLPack for MPS↔MLX to see if decode-only hybrid becomes viable.
+
 
 1. **FP32 decoder on MPS** (properly instrumented) — does removing bf16 help or hurt on MPS?
 2. **Precompute cross-attention once per batch** — already done (`precompute_mem_kv`), verify it's actually used
