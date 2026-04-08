@@ -4,19 +4,22 @@
 <h1 align="center">Turbodocling</h1>
 <p align="center">
   <strong>Docling, but actually fast enough for real apps.</strong><br>
-  5–6× faster. 40–200× cheaper than Textract or Mistral OCR.<br>
-  <code>cdk deploy</code> and it's running in minutes.
+  5–6× faster on GPU &bull; runs locally on your laptop in seconds<br>
+  Zero AWS required to start. Deploy to AWS only when you need scale.
 </p>
 
 ---
 
 Stock Docling is great at quality. Terrible at speed.
-A 93-page 10-K takes **71 seconds** on an A10G. That's unusable if a user just dropped a PDF in your chat.
+A 93-page 10-K takes **71 seconds** on an A10G.
 
-Turbodocling fixes it. Same quality, but the same 10-K now finishes in **13 seconds**.
-That's fast enough to do PDF → Markdown → LLM response inline. No background jobs. No "we'll email you later."
+Turbodocling is the same high-quality pipeline, completely re-architected.
+Same 10-K now finishes in **13 seconds** on AWS.
+On a MacBook Pro M1 Max it processes a 48-page 10-Q in **~24 seconds** via MPS. Still optimizing — target is sub-20s.
 
-### Real numbers
+That's fast enough to drop a PDF into your chat UI and get structured Markdown + elements back inline. No background jobs. No "we'll email you later."
+
+### Real numbers (AWS GPU)
 
 | Document          | Pages | Turbodocling | Stock Docling | Speedup |
 |-------------------|-------|--------------|---------------|---------|
@@ -24,59 +27,17 @@ That's fast enough to do PDF → Markdown → LLM response inline. No background
 | NVIDIA 10-Q       | 48    | **6.5 s**    | 40.7 s        | 6.3×    |
 | NVIDIA 10-K       | 93    | **12.8 s**   | 71.0 s        | 5.5×    |
 
-**20 concurrent 93-page 10-Ks (1 860 pages total):**
-**16.7 pages/sec** vs ~1.3 pages/sec for stock Docling.
+**20 concurrent 93-page 10-Ks (1 860 pages):** **16.7 pages/sec** vs ~1.3 pages/sec stock.
 
-### Cost that actually makes sense
+### Local performance (Apple Silicon)
 
-**Turbodocling cost per 10 000 pages** (Lambda + Step Functions + GPU)
-
-| GPU utilization | Turbodocling | vs Textract ($150) | vs Mistral ($30) |
-|-----------------|--------------|--------------------|------------------|
-| **100%** (batch/backfill) | **$0.28** | 536× cheaper | 107× cheaper |
-| **30%** (real-time / bursty) | **$0.74** | 203× cheaper | 41× cheaper |
-
-- The **$0.28** figure is at full utilization (16.7 pages/sec sustained). That's the number for overnight batch jobs or backfills.
-- At 30% utilization (typical for real-time chat/RAG traffic) the effective cost rises to **$0.74** because you're still paying for the GPU when it's idle.
-- Spot instances cut the GPU component by ~70% ($0.36/hr vs $1.21/hr on-demand).
-- One always-on A10G is ~$870/mo on-demand. Still **orders of magnitude** cheaper than API services while handling real traffic.
-
-Bottom line: whether you're doing batch or real-time, this is the difference between "we can't afford OCR" and "it just works."
+- 48-page 10-Q → **~24 s** on M1 Max (MPS)
+- Works out of the box on CPU / CUDA / MPS
+- No Docker, no cloud, no credentials
 
 ---
 
-## Architecture (the part that actually matters)
-
-```
-PDF → Step Function
-     ↓
-┌─ Lambda 1: pages 1-2  [parse + render] ─┐
-├─ Lambda 2: pages 3-4  [parse + render] ─┤
-├─ ...                                     │
-└─ Lambda 40: pages 79-80 [parse + render] ┘
-     ↓ (SQS)
-GPU Worker (A10G ECS) → only inference + post-processing
-     ↓
-S3 (output.md + elements.json)
-```
-
-Everything CPU-heavy (parsing, rendering) runs in parallel Lambdas.
-The GPU only does the expensive model work. That single change is most of the speedup.
-
-### The three big changes we made
-
-1. **Split CPU and GPU work**
-   Stock Docling runs everything on the same machine. You pay A10G prices for parsing and image rendering. We moved that to cheap parallel Lambdas.
-
-2. **Rewrote TableFormer from scratch**
-   No more one-table-at-a-time. No more recomputing attention every token. Batched + KV-cached + multi-threaded. Huge win.
-
-3. **Everything else optimized to death**
-   Vectorized numpy everywhere, spatial indexes instead of O(N²) loops, C++ parser patches, zero-copy data paths, multi-threaded pipeline with backpressure. The boring stuff that adds up.
-
----
-
-## Getting Started
+## Getting Started (local first)
 
 ```bash
 git clone https://github.com/lucasastorian/turbodocling.git
@@ -95,32 +56,32 @@ pip install -e shared/docling_parse
 python -m turbodocling my_document.pdf -o output/
 ```
 
-That's it. Outputs `output/output.md` and `output/elements.json`. Works on CPU, CUDA, or Apple Silicon (MPS).
+One command. Outputs:
+- `output/output.md` — clean Markdown
+- `output/elements.json` — structured elements with bboxes + image crops
 
-Options:
-- `--device auto|cuda|mps|cpu` — inference device (default: auto-detect)
-- `--workers N` — preprocessing parallelism (default: CPU count)
+**Options:**
+- `--device auto|cuda|mps|cpu` (default: auto-detect)
+- `--workers N` (default: CPU core count)
 
-On Apple Silicon, both layout and table inference run on the GPU via MPS. On a MacBook Pro M1 Max, a 48-page NVIDIA 10-Q processes in ~24 seconds.
-
-#### Python API
+**Python API:**
 
 ```python
 from turbodocling.local_runner import run_local
 
-result = run_local("my_document.pdf", "output/", device="auto")
-# result.md_path, result.elements_path, result.wall_time_s, ...
+result = run_local("my_document.pdf", output_dir="output/", device="auto")
+print(result.wall_time_s, result.md_path, result.elements_path)
 ```
 
-### Deploy to AWS (for speed + scale)
+---
 
-For production throughput, deploy the full pipeline to AWS:
+### Deploy to AWS (only if you need production scale)
 
 ```bash
 cdk deploy
 ```
 
-Then process PDFs via Step Functions:
+Then call the Step Function:
 
 ```python
 import boto3, json, uuid
@@ -152,7 +113,43 @@ Results land in S3:
 - `processed/user/{job_id}/output.md` → clean markdown
 - `processed/user/{job_id}/elements.json` → the good stuff (see below)
 
-### Working with elements.json (this is what you'll actually use in production)
+---
+
+## Cost that actually makes sense (AWS only)
+
+**Turbodocling cost per 10 000 pages**
+
+| GPU utilization       | Cost      | vs Textract ($150) | vs Mistral ($30) |
+|-----------------------|-----------|--------------------|------------------|
+| 100% (batch/backfill) | **$0.28** | 536× cheaper       | 107× cheaper     |
+| 30% (real-time)       | **$0.74** | 203× cheaper       | 41× cheaper      |
+
+Spot instances drop the GPU portion another ~70%.
+One always-on A10G is ~$870/mo on-demand — still orders of magnitude cheaper than API services.
+
+---
+
+## Architecture (the part that actually matters)
+
+**Local** → single-process, multi-threaded + MPS/CUDA/CPU
+**AWS** → Step Function → 40 parallel Lambdas (parse + render) → A10G worker (inference only)
+
+Everything CPU-heavy is off the critical path. TableFormer is fully batched + KV-cached. The rest is hundreds of vectorized + zero-copy optimizations.
+
+### The three big changes we made
+
+1. **Split CPU and GPU work**
+   Stock Docling runs everything on the same machine. You pay A10G prices for parsing and image rendering. We moved that to cheap parallel Lambdas.
+
+2. **Rewrote TableFormer from scratch**
+   No more one-table-at-a-time. No more recomputing attention every token. Batched + KV-cached + multi-threaded. Huge win.
+
+3. **Everything else optimized to death**
+   Vectorized numpy everywhere, spatial indexes instead of O(N²) loops, C++ parser patches, zero-copy data paths, multi-threaded pipeline with backpressure. The boring stuff that adds up.
+
+---
+
+## Working with elements.json (what you'll actually use)
 
 ```json
 {
@@ -184,7 +181,7 @@ Results land in S3:
 }
 ```
 
-Every element has bounding boxes, page numbers, and image crops ready for multimodal LLMs. Perfect for RAG chunking, provenance tracking, or custom filtering.
+Every element includes bounding boxes and (for pictures) ready-to-use base64 crops. Perfect for RAG, multimodal prompts, provenance, or custom filtering.
 
 ---
 
@@ -192,11 +189,16 @@ Every element has bounding boxes, page numbers, and image crops ready for multim
 
 - **No OCR yet** (native text layer only)
 - **Equations come out as image crops only**
-- **TableFormer still occasionally struggles with weird layouts** (we added fallback reconciliation to prevent silent data loss, but test your docs)
-- **MPS (Apple Silicon) support is experimental.** Layout and table inference both run on MPS and produce correct output on our test corpus, but performance varies by table complexity. Long or structurally dense tables may be slower than expected because the autoregressive decode path is inherently sequential. Set `TURBODOCLING_TABLE_MPS=0` to fall back to CPU for table inference if you hit issues.
+- **TableFormer occasionally struggles with very weird layouts** (fallback reconciliation prevents data loss, but test your docs)
+- **MPS (Apple Silicon) support is experimental.** Layout and table inference both run on MPS and produce correct output on our test corpus, but performance varies by table complexity. Long or structurally dense tables may be slower because the autoregressive decode path is inherently sequential. Set `TURBODOCLING_TABLE_MPS=0` to fall back to CPU for table inference if needed.
 
 ---
 
 ## License
 
-Apache 2.0. Built on top of the excellent [Docling](https://github.com/DS4SD/docling) work from IBM Research (MIT licensed).
+Apache 2.0. Built on the excellent [Docling](https://github.com/DS4SD/docling) work from IBM Research (MIT licensed).
+
+---
+
+**Local is the default.** Try it in 30 seconds. Deploy to AWS only when you need massive throughput.
+We're still pushing local performance harder — next target: sub-20s on M1/M2/M3 for a 48-page 10-Q.
