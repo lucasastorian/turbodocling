@@ -80,7 +80,6 @@ PYBIND11_MODULE(pdf_parsers, m) {
 	 },
 	 pybind11::arg("key"),
 	 pybind11::arg("filename"),
-	 pybind11::call_guard<pybind11::gil_scoped_release>(),
 	 R"(
     Load a document by key and filename.
 
@@ -186,7 +185,6 @@ PYBIND11_MODULE(pdf_parsers, m) {
 	 pybind11::arg("key"),
 	 pybind11::arg("page_boundary") = "crop_box",
 	 pybind11::arg("do_sanitization") = true,
-	 pybind11::call_guard<pybind11::gil_scoped_release>(),
 	 R"(
     Parse the PDF document identified by its unique key and return a JSON representation.
 
@@ -210,7 +208,6 @@ PYBIND11_MODULE(pdf_parsers, m) {
 	 pybind11::arg("page"),
 	 pybind11::arg("page_boundary") = "crop_box",
 	 pybind11::arg("do_sanitization") = true,
-	 pybind11::call_guard<pybind11::gil_scoped_release>(),
 	 R"(
     Parse a specific page of the PDF document identified by its unique key and return a JSON representation.
 
@@ -235,7 +232,6 @@ PYBIND11_MODULE(pdf_parsers, m) {
 	 pybind11::arg("page"),
 	 pybind11::arg("page_boundary") = "crop_box",
 	 pybind11::arg("do_sanitization") = true,
-	 pybind11::call_guard<pybind11::gil_scoped_release>(),
 	 R"(
     Parse a specific page and return only the original page payload.
 
@@ -260,7 +256,6 @@ PYBIND11_MODULE(pdf_parsers, m) {
 	 pybind11::arg("page"),
 	 pybind11::arg("page_boundary") = "crop_box",
 	 pybind11::arg("do_sanitization") = true,
-	 pybind11::call_guard<pybind11::gil_scoped_release>(),
 	 R"(
     Parse a specific page and return only the original page payload with compact cell rows.
 

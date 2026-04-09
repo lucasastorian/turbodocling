@@ -83,6 +83,18 @@ def run_local(
     print(f"Processing {pdf_path.name} ({total_pages} pages)")
     t_wall_start = time.perf_counter()
 
+    # ── Start model loading in background while preprocessing runs ────────
+    # Model init (loading weights + MPS warmup) takes ~8s and is independent
+    # of preprocessing. Overlapping them saves most of the init cost.
+    import threading as _threading
+
+    pipeline_state = {}
+    def _init_pipeline():
+        pipeline_state['result'] = _create_inference_pipeline()
+
+    init_thread = _threading.Thread(target=_init_pipeline, daemon=True)
+    init_thread.start()
+
     # ── Phase 1: Preprocessing (parallel, CPU) ────────────────────────────
     t_pre_start = time.perf_counter()
     page_dicts = _preprocess_parallel(pdf_bytes, total_pages, workers, batch_size)
@@ -92,9 +104,14 @@ def run_local(
     # Reconstruct Page objects from packed dicts
     all_pages = [reconstruct_page(pd) for pd in page_dicts]
 
+    # Wait for model loading to finish
+    init_thread.join()
+
     # ── Phase 2: GPU Pipeline (threaded, single process) ──────────────────
     t_inf_start = time.perf_counter()
-    processed_pages = _run_inference_pipeline(all_pages, total_pages)
+    processed_pages = _run_inference_pipeline(
+        all_pages, total_pages, pipeline=pipeline_state['result']
+    )
     t_inf_end = time.perf_counter()
     print(f"  Inference: {t_inf_end - t_inf_start:.2f}s")
 
@@ -173,14 +190,12 @@ def _preprocess_parallel(
     return all_dicts
 
 
-def _run_inference_pipeline(all_pages, total_pages: int) -> List:
+def _create_inference_pipeline():
     """
-    Run layout + table inference + postprocessing using the same threaded
-    pipeline as the production GPU worker.
+    Create and initialize the inference pipeline (loads models, warmup).
+    Can be called in a background thread to overlap with preprocessing.
     """
     import torch
-    # GPUService.__init__ sets torch.set_num_threads(1) for the GPU worker.
-    # Override that for local CPU inference so PyTorch uses all cores.
     if not torch.cuda.is_available():
         torch.set_num_threads(os.cpu_count() or 4)
 
@@ -188,7 +203,6 @@ def _run_inference_pipeline(all_pages, total_pages: int) -> List:
     from processor.postprocess_service.service import PostprocessService
     from processor.table_postprocessing_service.service import TablePostprocessingService
 
-    # Set up the same queue topology as main.py
     layout_queue = queue.Queue(maxsize=4096)
     postprocess_queue = queue.Queue(maxsize=4096)
     table_queue = queue.Queue(maxsize=4096)
@@ -196,7 +210,6 @@ def _run_inference_pipeline(all_pages, total_pages: int) -> List:
     final_queue = queue.Queue(maxsize=4096)
     shutdown_event = threading.Event()
 
-    # Start service threads
     services = [
         ("GPUService", GPUService, (
             layout_queue, postprocess_queue, table_queue,
@@ -212,6 +225,27 @@ def _run_inference_pipeline(all_pages, total_pages: int) -> List:
         t = threading.Thread(target=_run_service, args=(cls, args), name=name, daemon=True)
         t.start()
         threads.append(t)
+
+    return {
+        'layout_queue': layout_queue,
+        'final_queue': final_queue,
+        'shutdown_event': shutdown_event,
+        'threads': threads,
+    }
+
+
+def _run_inference_pipeline(all_pages, total_pages: int, pipeline=None) -> List:
+    """
+    Run layout + table inference + postprocessing using the same threaded
+    pipeline as the production GPU worker.
+    """
+    if pipeline is None:
+        pipeline = _create_inference_pipeline()
+
+    layout_queue = pipeline['layout_queue']
+    final_queue = pipeline['final_queue']
+    shutdown_event = pipeline['shutdown_event']
+    threads = pipeline['threads']
 
     # Feed pages into the layout queue (same format as intake_service)
     job_id = str(uuid.uuid4())
