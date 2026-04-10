@@ -12,12 +12,27 @@ Usage:
 """
 
 import math
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as mlx_nn
 import numpy as np
 import torch
+
+
+@dataclass
+class MLXDecodeResult:
+    """Structured result from the MLX tag decoder.
+
+    Replaces the previous _last_* side-channel state on the decoder.
+    """
+    tag_ids: mx.array           # [B, T+1] with <start> at [:,0]
+    tag_hidden: mx.array        # [B, max_emit, D] captured hidden states
+    lengths: np.ndarray         # [B] real decoded length per sample
+    h_counts: np.ndarray        # [B] number of hidden states captured per sample
+    span_starts: List[List[int]]  # per-sample list of span start indices (into tag_hidden)
+    span_ends: List[List[int]]    # per-sample list of span end indices
 
 
 def _torch_to_mlx(t: torch.Tensor) -> mx.array:
@@ -33,89 +48,6 @@ def _torch_to_mlx_bf16(t: torch.Tensor) -> mx.array:
 def _mlx_to_torch(a: mx.array, device: str = "mps", dtype=torch.bfloat16) -> torch.Tensor:
     """Convert MLX array back to PyTorch tensor."""
     return torch.from_numpy(np.array(a, copy=False).astype(np.float32)).to(dtype=dtype, device=device)
-
-
-class MLXEncoderLayer:
-    """Standard transformer encoder layer in MLX (self-attn + FFN + LayerNorm)."""
-
-    def __init__(self, embed_dim: int, num_heads: int):
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-
-    @classmethod
-    def from_torch_layer(cls, layer, embed_dim: int, num_heads: int, use_fp32: bool = False) -> "MLXEncoderLayer":
-        obj = cls(embed_dim, num_heads)
-        convert = _torch_to_mlx if use_fp32 else _torch_to_mlx_bf16
-
-        mha = layer.self_attn
-        obj.sa_qkv_weight = convert(mha.in_proj_weight)
-        obj.sa_qkv_bias = convert(mha.in_proj_bias)
-        obj.sa_out_weight = convert(mha.out_proj.weight)
-        obj.sa_out_bias = convert(mha.out_proj.bias)
-        obj.norm1_weight = convert(layer.norm1.weight)
-        obj.norm1_bias = convert(layer.norm1.bias)
-
-        obj.ffn_w1 = convert(layer.linear1.weight)
-        obj.ffn_b1 = convert(layer.linear1.bias)
-        obj.ffn_w2 = convert(layer.linear2.weight)
-        obj.ffn_b2 = convert(layer.linear2.bias)
-        obj.norm2_weight = convert(layer.norm2.weight)
-        obj.norm2_bias = convert(layer.norm2.bias)
-
-        return obj
-
-    def __call__(self, x: mx.array) -> mx.array:
-        """x: [S, B, D] — standard transformer encoder semantics."""
-        E = self.embed_dim
-        H = self.num_heads
-        Dh = self.head_dim
-        S, B, D = x.shape
-
-        # Self-attention
-        qkv = x.reshape(S * B, D) @ self.sa_qkv_weight.T + self.sa_qkv_bias  # [S*B, 3E]
-        q, k, v = mx.split(qkv, 3, axis=-1)  # each [S*B, E]
-
-        q = q.reshape(S, B, H, Dh).transpose(1, 2, 0, 3)  # [B, H, S, Dh]
-        k = k.reshape(S, B, H, Dh).transpose(1, 2, 0, 3)
-        v = v.reshape(S, B, H, Dh).transpose(1, 2, 0, 3)
-
-        scale = math.sqrt(Dh)
-        attn = (q @ mx.transpose(k, (0, 1, 3, 2))) / scale  # [B, H, S, S]
-        attn = mx.softmax(attn, axis=-1)
-        sa_out = attn @ v  # [B, H, S, Dh]
-
-        sa_out = sa_out.transpose(2, 0, 1, 3).reshape(S, B, E)  # [S, B, E]
-        sa_out = sa_out.reshape(S * B, E) @ self.sa_out_weight.T + self.sa_out_bias
-        sa_out = sa_out.reshape(S, B, E)
-
-        x = _layer_norm(x + sa_out, self.norm1_weight, self.norm1_bias)
-
-        # FFN
-        ff = x.reshape(S * B, D) @ self.ffn_w1.T + self.ffn_b1
-        ff = mx.maximum(ff, 0)  # ReLU
-        ff = ff @ self.ffn_w2.T + self.ffn_b2
-        ff = ff.reshape(S, B, E)
-
-        x = _layer_norm(x + ff, self.norm2_weight, self.norm2_bias)
-        return x
-
-
-class MLXTransformerEncoder:
-    """Stack of MLX encoder layers, matching nn.TransformerEncoder."""
-
-    def __init__(self, layers: List[MLXEncoderLayer]):
-        self.layers = layers
-
-    @classmethod
-    def from_torch_encoder(cls, torch_encoder, embed_dim: int, num_heads: int, use_fp32: bool = True) -> "MLXTransformerEncoder":
-        layers = [MLXEncoderLayer.from_torch_layer(l, embed_dim, num_heads, use_fp32=use_fp32) for l in torch_encoder.layers]
-        return cls(layers)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        for layer in self.layers:
-            x = layer(x)
-        return x
 
 
 class MLXDecoderLayer:
@@ -267,21 +199,35 @@ def _layer_norm(x: mx.array, weight: mx.array, bias: mx.array, eps: float = 1e-5
 
 
 class MLXTagDecoder:
-    """Full MLX tag decoder with transformer encoder + decode loop."""
+    """
+    MLX-native autoregressive tag decoder for TableFormer.
+
+    Heavy math (attention, MLP, logits) runs on MLX.
+    Control logic (structure corrections, emit bookkeeping, span tracking)
+    stays on the host in numpy — it's tiny and easier to keep faithful
+    to the PyTorch batched decoder.
+
+    Experiments that did NOT help (removed from code, kept here for history):
+    - Full MLX transformer encoder: marginally faster (~3%), parity-sensitive.
+      The PyTorch transformer encoder is only ~5% of TableFormer time and
+      parity is rock solid through that boundary.
+    - mx.compile on layer __call__: slower (8.0s vs 6.0s for 44 tables)
+      because the layer takes an integer `t` that changes every step, likely
+      causing retrace. A proper compile would need stacked [L,...] caches,
+      t as a tensor input, and mask-based attention. Not worth the refactor.
+    """
 
     def __init__(
         self,
-        encoder: MLXTransformerEncoder,
         layers: List[MLXDecoderLayer],
-        embedding_weight: mx.array,   # [V, D]
-        pe: mx.array,                 # [max_len, D]
-        fc_weight: mx.array,          # [V, D]
-        fc_bias: mx.array,            # [V]
+        embedding_weight: mx.array,
+        pe: mx.array,
+        fc_weight: mx.array,
+        fc_bias: mx.array,
         word_map: Dict[str, int],
         num_heads: int,
         embed_dim: int,
     ):
-        self.encoder = encoder
         self.layers = layers
         self.embedding_weight = embedding_weight
         self.pe = pe
@@ -324,10 +270,6 @@ class MLXTagDecoder:
         E = tt._decoder_dim
         H = tt._decoder.layers[0].self_attn.num_heads
 
-        # Encoder
-        encoder = MLXTransformerEncoder.from_torch_encoder(tt._encoder, E, H)
-
-        # Decoder layers
         layers = []
         for torch_layer in tt._decoder.layers:
             layers.append(MLXDecoderLayer.from_torch_layer(torch_layer, E, H))
@@ -343,7 +285,6 @@ class MLXTagDecoder:
         fc_bias = _torch_to_mlx(tt._fc.bias)
 
         return cls(
-            encoder=encoder,
             layers=layers,
             embedding_weight=emb_weight,
             pe=pe,
@@ -376,42 +317,14 @@ class MLXTagDecoder:
         mx.eval(*[k for pair in mem_kv for k in pair])
         return mem_kv
 
-    def encode_and_decode(
-        self,
-        filtered_torch: torch.Tensor,  # [B, C, h, w] post input_filter, FP32
-        max_steps: int,
-    ) -> Tuple[mx.array, mx.array, mx.array]:
-        """
-        Run transformer encoder + decode loop entirely on MLX.
-        Takes the input_filter output from PyTorch, converts once.
-
-        Returns:
-            tag_ids, tag_hidden, lengths
-        """
-        # Convert filtered features to MLX: [B, C, h, w] → [S, B, D]
-        # Use fp32 for the encoder to minimize numeric drift, then cast to bf16 for decoder
-        filtered_mlx = _torch_to_mlx(filtered_torch.permute(0, 2, 3, 1))  # [B, h, w, C] FP32
-        B, h, w, C = filtered_mlx.shape
-        mem = filtered_mlx.reshape(B, h * w, C).transpose(1, 0, 2)  # [S, B, D] where S=h*w
-
-        # Run transformer encoder on MLX (fp32 for parity, then cast to bf16 for decoder)
-        mem_enc = self.encoder(mem)
-        mem_enc = mem_enc.astype(mx.bfloat16)
-        mx.eval(mem_enc)
-
-        # Precompute cross-attention K/V and decode
-        return self._decode_from_mem(mem_enc, max_steps)
-
     def decode(
         self,
         mem_enc_torch: torch.Tensor,  # [S, B, D] encoder memory from PyTorch
         max_steps: int,
-    ) -> Tuple[mx.array, mx.array, mx.array]:
+    ) -> MLXDecodeResult:
         """
         Decode-only path (encoder already run on PyTorch).
-        Processes tables one at a time to avoid padding-induced attention
-        drift in batched mode. Still fast because MLX per-table decode
-        is ~50ms.
+        Converts mem_enc once and runs the AR decode on MLX.
         """
         mem_enc = _torch_to_mlx(mem_enc_torch)
         return self._decode_from_mem(mem_enc, max_steps)
@@ -420,7 +333,7 @@ class MLXTagDecoder:
         self,
         mem_enc: mx.array,  # [S, B, D] already on MLX
         max_steps: int,
-    ) -> Tuple[mx.array, mx.array, mx.array]:
+    ) -> MLXDecodeResult:
         """Core decode loop. mem_enc is already on MLX."""
         mem_kv = self._precompute_mem_kv_mlx(mem_enc)
 
@@ -468,8 +381,8 @@ class MLXTagDecoder:
             x = emb + pos
 
             # Run through decoder layers (MLX — the heavy work)
-            for i, layer in enumerate(self.layers):
-                x, sa_k_caches[i], sa_v_caches[i] = layer(
+            for i in range(self.n_layers):
+                x, sa_k_caches[i], sa_v_caches[i] = self.layers[i](
                     x, sa_k_caches[i], sa_v_caches[i], step,
                     mem_kv[i][0], mem_kv[i][1],
                 )
@@ -539,9 +452,15 @@ class MLXTagDecoder:
             if finished.all():
                 break
 
-        # Store h_counts and span info for bbox decoder integration
-        self._last_h_counts = h_counts
-        self._last_span_starts = span_starts_list
-        self._last_span_ends = span_ends_list
+        # Bounds assertion: captured hidden count should never exceed buffer size
+        assert (h_counts <= max_steps).all(), \
+            f"h_counts overflow: max={h_counts.max()} > {max_steps}"
 
-        return mx.array(tag_ids_np), tag_H_buffer, mx.array(lengths)
+        return MLXDecodeResult(
+            tag_ids=mx.array(tag_ids_np),
+            tag_hidden=tag_H_buffer,
+            lengths=lengths,
+            h_counts=h_counts,
+            span_starts=span_starts_list,
+            span_ends=span_ends_list,
+        )

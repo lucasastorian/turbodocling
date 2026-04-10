@@ -305,19 +305,30 @@ class LayoutPredictor:
 
             for img, res in zip(chunk[:b], res_cpu[:b]):
                 w, h = img.size
+
+                # Bulk-convert scores/labels/boxes once instead of repeated
+                # scalar .item() access in the per-prediction loop. Reduces
+                # Python overhead substantially even after tensors are on CPU.
+                scores_np = res["scores"].numpy() if res["scores"].numel() > 0 else None
+                labels_np = res["labels"].numpy() if res["labels"].numel() > 0 else None
+                boxes_np = res["boxes"].numpy() if res["boxes"].numel() > 0 else None
+
                 preds = []
-                for score, label_id, box in zip(res["scores"], res["labels"], res["boxes"]):
-                    s = float(score.item())
-                    lid = int(label_id.item()) + self._label_offset
-                    lbl = self._classes_map[lid]
-                    if lbl in self._black_classes:
-                        continue
-                    x1, y1, x2, y2 = [float(bi.item()) for bi in box]
-                    l = min(w, max(0.0, x1));
-                    t = min(h, max(0.0, y1))
-                    r = min(w, max(0.0, x2));
-                    btm = min(h, max(0.0, y2))
-                    preds.append({"l": l, "t": t, "r": r, "b": btm, "label": lbl, "confidence": s})
+                if scores_np is not None:
+                    for i in range(len(scores_np)):
+                        lid = int(labels_np[i]) + self._label_offset
+                        lbl = self._classes_map[lid]
+                        if lbl in self._black_classes:
+                            continue
+                        x1, y1, x2, y2 = boxes_np[i]
+                        preds.append({
+                            "l": float(min(w, max(0.0, x1))),
+                            "t": float(min(h, max(0.0, y1))),
+                            "r": float(min(w, max(0.0, x2))),
+                            "b": float(min(h, max(0.0, y2))),
+                            "label": lbl,
+                            "confidence": float(scores_np[i]),
+                        })
                 results_all.append(preds)
 
         return results_all

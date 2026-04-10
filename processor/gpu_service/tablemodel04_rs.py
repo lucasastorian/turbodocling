@@ -242,76 +242,73 @@ class TableModel04_rs(BaseModel, nn.Module):
                 use_mlx = False
 
         if use_mlx:
-            # MLX decode-only: PyTorch runs encoder, MLX runs tag decode.
-            # 2x faster than PyTorch MPS decode with 100% parity.
+            if not hasattr(self, '_mlx_decoder'):
+                self._mlx_decoder = MLXTagDecoder.from_torch_model(self)
 
-            # Run torch transformer encoder (parity-safe)
-            with timer.time_section('memory_reshape'):
+            # MLX decode-only: PyTorch runs the transformer encoder,
+            # MLX runs the AR tag decode. ~1.9x faster than PyTorch MPS
+            # with 100% parity on the golden corpus.
+            with timer.time_section('mlx_memory_reshape'):
                 filtered_nhwc = filtered_nchw.permute(0, 2, 3, 1)
                 B_, h, w, C = filtered_nhwc.shape
                 mem = filtered_nhwc.reshape(B_, h * w, C).permute(1, 0, 2).contiguous()
                 mem = mem.to(torch.bfloat16)
 
-            with timer.time_section('tag_encoder'):
+            with timer.time_section('mlx_tag_encoder'):
                 mem_enc = self._tag_transformer._encoder(mem, mask=None)
 
             with timer.time_section('mlx_decode'):
-                if not hasattr(self, '_mlx_decoder'):
-                    self._mlx_decoder = MLXTagDecoder.from_torch_model(self)
-                tag_ids_mlx, tag_H_mlx, lengths_mlx = self._mlx_decoder.decode(
-                    mem_enc, max_steps=max_steps
-                )
-                mx.eval(tag_ids_mlx, tag_H_mlx, lengths_mlx)
+                mlx_result = self._mlx_decoder.decode(mem_enc, max_steps=max_steps)
+                mx.eval(mlx_result.tag_ids, mlx_result.tag_hidden)
 
-                # Convert back to the format BatchedTableDecoder.predict_batched returns:
-                # List[(seq, cls_logits, coords)]
-                import numpy as np
-                tag_ids_np = np.array(tag_ids_mlx.astype(mx.int32))
-                lengths_np = np.array(lengths_mlx.astype(mx.int32))
-                inv_map = {v: k for k, v in self._init_data["word_map"]["word_map_tag"].items()}
-                end_id = self._mlx_decoder.end_id
+            # Convert MLX result back to (seq, cls_logits, coords) tuples
+            # matching BatchedTableDecoder.predict_batched's format.
+            import numpy as np
+            tag_ids_np = np.array(mlx_result.tag_ids.astype(mx.int32))
+            end_id = self._mlx_decoder.end_id
+            start_id = self._mlx_decoder.start_id
 
-                start_id = self._mlx_decoder.start_id
-                results = []
-                for b in range(B):
-                    # Extract sequence — include <start> and <end> to match
-                    # BatchedTableDecoder._trim_sequence format
-                    seq = [start_id]
-                    for tid in tag_ids_np[b, 1:]:
-                        t_int = int(tid)
-                        seq.append(t_int)
-                        if t_int == end_id:
-                            break
+            results = []
+            for b in range(B):
+                seq = [start_id]
+                for tid in tag_ids_np[b, 1:]:
+                    t_int = int(tid)
+                    seq.append(t_int)
+                    if t_int == end_id:
+                        break
 
-                    # Get tag hidden states for bbox decoder
-                    count = int(self._mlx_decoder._last_h_counts[b])
-                    # Convert MLX hidden states to torch for bbox decoder
-                    if self._bbox and count > 0:
-                        tag_H_np = np.array(tag_H_mlx[b, :count].astype(mx.float32))
-                        tag_H_tensor = torch.from_numpy(tag_H_np).to(dtype=torch.bfloat16, device=self._device)
-                        enc_nchw = enc_out_batch[b:b+1]
-                        cls_logits, coords = self._bbox_decoder.inference(enc_nchw, tag_H_tensor)
+                count = int(mlx_result.h_counts[b])
+                assert count <= mlx_result.tag_hidden.shape[1], \
+                    f"h_count {count} exceeds tag_hidden buffer {mlx_result.tag_hidden.shape[1]}"
 
-                        # Apply span merging (matches torch batched decoder)
-                        span_s = self._mlx_decoder._last_span_starts[b]
-                        span_e = self._mlx_decoder._last_span_ends[b]
-                        if span_s and len(coords) > 0:
-                            Tmax = max_steps
-                            starts_t = torch.full((Tmax,), -1, dtype=torch.long, device=self._device)
-                            ends_t = torch.full((Tmax,), -1, dtype=torch.long, device=self._device)
-                            for si, (s, e) in enumerate(zip(span_s, span_e)):
-                                if si < Tmax:
-                                    starts_t[si] = s
-                                    ends_t[si] = e
-                            count_t = torch.tensor(len(span_s), device=self._device)
-                            cls_logits, coords = self._batched_decoder._merge_spans_gpu(
-                                cls_logits, coords, starts_t, ends_t, count_t
-                            )
-                    else:
-                        cls_logits = torch.empty(0, device=self._device)
-                        coords = torch.empty(0, device=self._device)
+                if self._bbox and count > 0:
+                    tag_H_np = np.array(mlx_result.tag_hidden[b, :count].astype(mx.float32))
+                    tag_H_tensor = torch.from_numpy(tag_H_np).to(dtype=torch.bfloat16, device=self._device)
+                    enc_nchw = enc_out_batch[b:b+1]
+                    cls_logits, coords = self._bbox_decoder.inference(enc_nchw, tag_H_tensor)
 
-                    results.append((seq, cls_logits, coords))
+                    # Apply span merging (matches torch batched decoder)
+                    span_s = mlx_result.span_starts[b]
+                    span_e = mlx_result.span_ends[b]
+                    if span_s and len(coords) > 0:
+                        Tmax = max_steps
+                        starts_t = torch.full((Tmax,), -1, dtype=torch.long, device=self._device)
+                        ends_t = torch.full((Tmax,), -1, dtype=torch.long, device=self._device)
+                        for si, (s, e) in enumerate(zip(span_s, span_e)):
+                            if si < Tmax:
+                                assert 0 <= s < count and 0 <= e < count, \
+                                    f"span ({s}, {e}) out of range for count={count}"
+                                starts_t[si] = s
+                                ends_t[si] = e
+                        count_t = torch.tensor(len(span_s), device=self._device)
+                        cls_logits, coords = self._batched_decoder._merge_spans_gpu(
+                            cls_logits, coords, starts_t, ends_t, count_t
+                        )
+                else:
+                    cls_logits = torch.empty(0, device=self._device)
+                    coords = torch.empty(0, device=self._device)
+
+                results.append((seq, cls_logits, coords))
         else:
             # Torch path: run transformer encoder + decoder on PyTorch
             with timer.time_section('memory_reshape'):
@@ -334,21 +331,34 @@ class TableModel04_rs(BaseModel, nn.Module):
         # Finalize and print timing if profiling enabled
         if self._prof:
             timer.finalize()
-            total_time = (timer.get_time('encoder_forward') + timer.get_time('tag_input_filter') +
-                          timer.get_time('memory_reshape') + timer.get_time('tag_encoder') +
-                          timer.get_time('batched_ar_decoder'))
             print(f"\n=== TableModel Timing (B={B}) ===")
             print(f"  encoder_forward:    {timer.get_time('encoder_forward'):7.1f} ms")
             print(f"  tag_input_filter:   {timer.get_time('tag_input_filter'):7.1f} ms")
-            print(f"  memory_reshape:     {timer.get_time('memory_reshape'):7.1f} ms")
-            print(f"  tag_encoder:        {timer.get_time('tag_encoder'):7.1f} ms")
-            print(f"  batched_ar_decoder: {timer.get_time('batched_ar_decoder'):7.1f} ms")
 
-            # Print decoder breakdown if available
-            if timer.get_time('ar_loop') > 0:
-                print(f"\n  === Decoder Breakdown ===")
-                print(f"    ar_loop:          {timer.get_time('ar_loop'):7.1f} ms")
-                print(f"    bbox_decode:      {timer.get_time('bbox_decode'):7.1f} ms")
+            if use_mlx:
+                print(f"  mlx_memory_reshape: {timer.get_time('mlx_memory_reshape'):7.1f} ms")
+                print(f"  mlx_tag_encoder:    {timer.get_time('mlx_tag_encoder'):7.1f} ms")
+                print(f"  mlx_decode:         {timer.get_time('mlx_decode'):7.1f} ms")
+                total_time = (timer.get_time('encoder_forward') +
+                              timer.get_time('tag_input_filter') +
+                              timer.get_time('mlx_memory_reshape') +
+                              timer.get_time('mlx_tag_encoder') +
+                              timer.get_time('mlx_decode'))
+            else:
+                print(f"  memory_reshape:     {timer.get_time('memory_reshape'):7.1f} ms")
+                print(f"  tag_encoder:        {timer.get_time('tag_encoder'):7.1f} ms")
+                print(f"  batched_ar_decoder: {timer.get_time('batched_ar_decoder'):7.1f} ms")
+                total_time = (timer.get_time('encoder_forward') +
+                              timer.get_time('tag_input_filter') +
+                              timer.get_time('memory_reshape') +
+                              timer.get_time('tag_encoder') +
+                              timer.get_time('batched_ar_decoder'))
+
+                # Print decoder breakdown if available
+                if timer.get_time('ar_loop') > 0:
+                    print(f"\n  === Decoder Breakdown ===")
+                    print(f"    ar_loop:          {timer.get_time('ar_loop'):7.1f} ms")
+                    print(f"    bbox_decode:      {timer.get_time('bbox_decode'):7.1f} ms")
 
             print(f"  ---------------------------")
             print(f"  TOTAL:              {total_time:7.1f} ms\n")
